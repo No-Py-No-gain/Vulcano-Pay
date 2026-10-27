@@ -1,0 +1,55 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# --- Entornos virtuales ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Testing / cobertura ---
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
+
+# --- Tipado / linters ---
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+.pyre/
+
+# --- Logs del motor (RotatingFileHandler + rotación gzip) ---
+*.log
+*.log.gz
+vulcano_events.log*
+logs/
+
+# --- Configuración y secretos ---
+.env
+.env.*
+!.env.example
+
+# --- IDE / sistema operativo ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Herramientas de agente / caché local ---
+.atl/
