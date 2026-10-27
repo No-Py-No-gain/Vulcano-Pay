@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vulcano-telemetry"
+version = "0.1.0"
+description = "Motor de eventos asincronos con webhooks HMAC y observabilidad JSON para Vulcano Pay"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "boto3",
+    "botocore",
+    "fastapi",
+    "uvicorn",
+    "requests",
+]
+
+[project.scripts]
+vulcano = "app_operator:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["app_operator"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: requiere LocalStack real en http://localhost:4566 (se activa con VULCANO_IT=1)",
+]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "BLE"]
+
+[tool.ruff.lint.per-file-ignores]
+# El CLI declara los grupos except* con nombres de excepción del dominio; no es un catch ciego.
+"src/app_operator.py" = ["BLE001"]
