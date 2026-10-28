@@ -25,7 +25,8 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from vulcano_telemetry.dispatcher import DespachadorSQS
-from vulcano_telemetry.webhook_crypto import generate_signature
+from vulcano_telemetry.exceptions import WebhookTimestampError
+from vulcano_telemetry.webhook_crypto import generate_signature, verify_signature
 from vulcano_telemetry.webhook_receiver import QUEUE_URL, WEBHOOK_SECRET, app
 
 ENDPOINT_URL = os.getenv("VULCANO_ENDPOINT_URL", "http://localhost:4566")
@@ -303,3 +304,21 @@ def test_un_mensaje_venenoso_termina_en_la_dlq(colas_de_caos):
     ).get("Messages", [])
 
     assert restantes == [], f"el mensaje venenoso sigue en {NOMBRE_COLA_PRUEBA}: {restantes!r}"
+
+
+def test_verify_signature_levanta_webhook_timestamp_error_con_un_timestamp_viejo():
+    """S11 pide el rechazo *por WebhookTimestampError*, no sólo el código HTTP del receptor.
+
+    La firma se genera correctamente para ese timestamp, así que la única razón para rechazarla es
+    la ventana anti-replay: si el orden de las validaciones se invirtiera, este test fallaría.
+    """
+    cuerpo = b'{"transaction_id": "tx_replay"}'
+    hace_una_hora = int(time.time()) - 3600
+    firma = generate_signature(WEBHOOK_SECRET, hace_una_hora, cuerpo)
+
+    with pytest.raises(WebhookTimestampError) as capturado:
+        verify_signature(WEBHOOK_SECRET, f"t={hace_una_hora},v1={firma}", cuerpo)
+
+    assert "tolerancia" in str(capturado.value), (
+        f"la excepción no describe el problema de ventana temporal: {capturado.value}"
+    )
