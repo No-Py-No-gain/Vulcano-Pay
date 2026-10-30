@@ -26,21 +26,21 @@ from typing import Any
 import pytest
 
 from vulcano_telemetry.dispatcher import (
-    CABECERA_FIRMA,
-    DespachadorSQS,
+    SIGNATURE_HEADER,
+    SQSDispatcher,
     dispatch_webhook,
-    serializar_cuerpo,
+    serialize_body,
 )
 from vulcano_telemetry.exceptions import WebhookDeliveryError
-from vulcano_telemetry.logging_engine import CAMPOS_OPCIONALES, AsyncJSONFormatter
+from vulcano_telemetry.logging_engine import OPTIONAL_FIELDS, AsyncJSONFormatter
 from vulcano_telemetry.webhook_crypto import verify_signature
 
-SECRETO = "s3cr3t-de-prueba"
-URL_COLA = "http://localhost:4566/000000000000/vulcano-events-queue"
-ESPERA_MAXIMA = 5.0
+SECRET = "s3cr3t-de-prueba"
+QUEUE_URL = "http://localhost:4566/000000000000/vulcano-events-queue"
+MAX_WAIT = 5.0
 
 
-class DestinoLocal:
+class LocalTarget:
     """Destino HTTP real en 127.0.0.1 con respuesta y demora configurables.
 
     No se mockea `requests`: la prueba de contrato de la firma necesita ver los bytes que de verdad
@@ -48,20 +48,20 @@ class DestinoLocal:
     """
 
     def __init__(self) -> None:
-        self.peticiones: list[dict[str, Any]] = []
+        self.posted: list[dict[str, Any]] = []
         self.status = 200
         self.delay = 0.0
-        destino = self
+        target = self
 
-        class Manejador(BaseHTTPRequestHandler):
+        class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:
-                largo = int(self.headers.get("Content-Length") or 0)
-                cuerpo = self.rfile.read(largo)
-                destino.peticiones.append({"headers": dict(self.headers), "cuerpo": cuerpo})
-                if destino.delay:
-                    time.sleep(destino.delay)
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length)
+                target.posted.append({"headers": dict(self.headers), "cuerpo": body})
+                if target.delay:
+                    time.sleep(target.delay)
                 try:
-                    self.send_response(destino.status)
+                    self.send_response(target.status)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                 except (BrokenPipeError, ConnectionResetError):
@@ -71,119 +71,119 @@ class DestinoLocal:
             def log_message(self, fmt: str, *args: Any) -> None:
                 """Silenciado a propósito: la salida de la suite sólo debe hablar por los asserts."""
 
-        self._servidor = ThreadingHTTPServer(("127.0.0.1", 0), Manejador)
-        self.url = f"http://127.0.0.1:{self._servidor.server_address[1]}/webhook"
-        self._hilo = threading.Thread(target=self._servidor.serve_forever, name="destino-http", daemon=True)
-        self._hilo.start()
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}/webhook"
+        self._thread = threading.Thread(target=self._server.serve_forever, name="destino-http", daemon=True)
+        self._thread.start()
 
     @property
-    def ultima_peticion(self) -> dict[str, Any]:
-        assert self.peticiones, "el destino no recibió ninguna petición"
-        return self.peticiones[-1]
+    def last_request(self) -> dict[str, Any]:
+        assert self.posted, "el destino no recibió ninguna petición"
+        return self.posted[-1]
 
-    def cerrar(self) -> None:
-        self._servidor.shutdown()
-        self._servidor.server_close()
-        self._hilo.join(timeout=ESPERA_MAXIMA)
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=MAX_WAIT)
 
 
-class ColectorDeRegistros(logging.Handler):
+class RecordCollector(logging.Handler):
     """Handler en memoria: guarda los `LogRecord` para inspeccionar los extras del contrato S5."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.registros: list[logging.LogRecord] = []
+        self.records: list[logging.LogRecord] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.registros.append(record)
+        self.records.append(record)
 
 
-class ClienteSQSFalso:
+class FakeSQSClient:
     """Doble de SQS: no habla con AWS, sólo registra las llamadas que hace el worker."""
 
-    def __init__(self, mensajes: list[dict[str, Any]] | None = None) -> None:
-        self.pendientes = list(mensajes or [])
-        self.recepciones: list[dict[str, Any]] = []
-        self.borrados: list[dict[str, Any]] = []
+    def __init__(self, messages: list[dict[str, Any]] | None = None) -> None:
+        self.pending = list(messages or [])
+        self.receive_count: list[dict[str, Any]] = []
+        self.delete_calls: list[dict[str, Any]] = []
 
-    def receive_message(self, **argumentos: Any) -> dict[str, Any]:
-        self.recepciones.append(argumentos)
-        lote, self.pendientes = self.pendientes, []
-        return {"Messages": lote} if lote else {}
+    def receive_message(self, **arguments: Any) -> dict[str, Any]:
+        self.receive_count.append(arguments)
+        batch, self.pending = self.pending, []
+        return {"Messages": batch} if batch else {}
 
-    def delete_message(self, **argumentos: Any) -> dict[str, Any]:
-        self.borrados.append(argumentos)
+    def delete_message(self, **arguments: Any) -> dict[str, Any]:
+        self.delete_calls.append(arguments)
         return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
 
 @pytest.fixture
-def destino():
+def target():
     """Servidor HTTP local vivo durante todo el caso; se cierra al finalizar (S6)."""
-    servidor = DestinoLocal()
-    yield servidor
-    servidor.cerrar()
+    target = LocalTarget()
+    yield target
+    target.close()
 
 
 @pytest.fixture
-def logger_pruebas():
+def test_logger():
     """Logger aislado con un handler en memoria, sin propagar al logger raíz."""
-    logger = logging.getLogger("vulcano_pruebas_dispatcher")
+    logger = logging.getLogger("vulcano_test_dispatcher")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     logger.handlers.clear()
-    colector = ColectorDeRegistros()
-    logger.addHandler(colector)
-    yield logger, colector.registros
-    logger.removeHandler(colector)
+    collector = RecordCollector()
+    logger.addHandler(collector)
+    yield logger, collector.records
+    logger.removeHandler(collector)
     logger.handlers.clear()
 
 
-def _cabecera(peticion: dict[str, Any], nombre: str) -> str | None:
+def _header(request: dict[str, Any], name: str) -> str | None:
     """Valor de una cabecera HTTP recibida, sin depender de cómo la escribió el cliente."""
-    for clave, valor in peticion["headers"].items():
-        if clave.lower() == nombre.lower():
-            return valor
+    for key, value in request["headers"].items():
+        if key.lower() == name.lower():
+            return value
     return None
 
 
-def _mensaje(
-    mensaje_id: str,
-    cuerpo: str,
-    ticket: str,
+def _message(
+    message_id: str,
+    body: str,
+    receipt_handle: str,
     *,
-    recepciones: int = 1,
+    receive_count: int = 1,
     trace_id: str | None = None,
 ) -> dict[str, Any]:
     """Mensaje SQS con la forma que devuelve Boto3 (cuerpo, ticket e intentos de recepción)."""
-    mensaje: dict[str, Any] = {
-        "MessageId": mensaje_id,
-        "Body": cuerpo,
-        "ReceiptHandle": ticket,
-        "Attributes": {"ApproximateReceiveCount": str(recepciones)},
+    message: dict[str, Any] = {
+        "MessageId": message_id,
+        "Body": body,
+        "ReceiptHandle": receipt_handle,
+        "Attributes": {"ApproximateReceiveCount": str(receive_count)},
     }
     if trace_id is not None:
-        mensaje["MessageAttributes"] = {"TraceId": {"StringValue": trace_id}}
-    return mensaje
+        message["MessageAttributes"] = {"TraceId": {"StringValue": trace_id}}
+    return message
 
 
-def _worker(cliente: Any, destino: DestinoLocal, logger: logging.Logger, **opciones: Any) -> DespachadorSQS:
-    return DespachadorSQS(cliente, URL_COLA, destino.url, SECRETO, logger, **opciones)
+def _build_worker(client: Any, target: LocalTarget, logger: logging.Logger, **options: Any) -> SQSDispatcher:
+    return SQSDispatcher(client, QUEUE_URL, target.url, SECRET, logger, **options)
 
 
-def test_el_receptor_verifica_la_firma_que_genera_el_despachador(destino):
+def test_receiver_verifies_the_signature_the_dispatcher_generates(target):
     """Contrato rol 5 ↔ rol 3: lo que firma el despachador lo acepta `verify_signature`."""
     payload = {"evento": "pago.aprobado", "monto": 1500.5, "moneda": "ARS"}
 
-    dispatch_webhook(destino.url, SECRETO, payload)
+    dispatch_webhook(target.url, SECRET, payload)
 
-    peticion = destino.ultima_peticion
-    cabecera = _cabecera(peticion, CABECERA_FIRMA)
+    request = target.last_request
+    header = _header(request, SIGNATURE_HEADER)
 
-    assert cabecera is not None, f"el POST no llevó la cabecera {CABECERA_FIRMA}"
-    assert verify_signature(SECRETO, cabecera, peticion["cuerpo"]) is True
+    assert header is not None, f"el POST no llevó la cabecera {SIGNATURE_HEADER}"
+    assert verify_signature(SECRET, header, request["cuerpo"]) is True
 
 
-def test_se_firman_y_envian_los_mismos_bytes(destino):
+def test_the_same_bytes_are_signed_and_sent(target):
     """El cuerpo que viaja es exactamente la serialización firmada, no una re-serialización."""
     payload = {
         "zeta": "último a propósito",
@@ -192,133 +192,133 @@ def test_se_firman_y_envian_los_mismos_bytes(destino):
         "anidado": {"ñ": True, "lista": [3, 2, 1]},
     }
 
-    dispatch_webhook(destino.url, SECRETO, payload)
+    dispatch_webhook(target.url, SECRET, payload)
 
-    peticion = destino.ultima_peticion
+    request = target.last_request
 
-    assert peticion["cuerpo"] == serializar_cuerpo(payload), (
+    assert request["cuerpo"] == serialize_body(payload), (
         "el cuerpo enviado no es byte a byte el que se firmó: json= de requests lo re-serializaría"
     )
-    assert json.loads(peticion["cuerpo"]) == payload
-    assert _cabecera(peticion, "Content-Type") == "application/json"
+    assert json.loads(request["cuerpo"]) == payload
+    assert _header(request, "Content-Type") == "application/json"
 
 
-def test_un_http_500_levanta_webhook_delivery_error_con_notas(destino):
+def test_http_500_raises_webhook_delivery_error_with_notes(target):
     """Un 5xx es fallo de entrega y las notas deben conservar la URL y el código."""
-    destino.status = 500
+    target.status = 500
 
-    with pytest.raises(WebhookDeliveryError) as capturado:
-        dispatch_webhook(destino.url, SECRETO, {"evento": "pago.aprobado"})
+    with pytest.raises(WebhookDeliveryError) as raised:
+        dispatch_webhook(target.url, SECRET, {"evento": "pago.aprobado"})
 
-    notas = "\n".join(capturado.value.__notes__)
+    notes = "\n".join(raised.value.__notes__)
 
-    assert destino.url in notas, f"las notas no mencionan la URL del destino: {notas!r}"
-    assert "500" in notas, f"las notas no mencionan el código HTTP 500: {notas!r}"
+    assert target.url in notes, f"las notas no mencionan la URL del destino: {notes!r}"
+    assert "500" in notes, f"las notas no mencionan el código HTTP 500: {notes!r}"
 
 
-def test_un_timeout_del_destino_levanta_webhook_delivery_error(destino):
+def test_target_timeout_raises_webhook_delivery_error(target):
     """Un destino más lento que el timeout es un fallo de entrega, no un cuelgue del worker."""
-    destino.delay = 0.6
+    target.delay = 0.6
 
-    with pytest.raises(WebhookDeliveryError) as capturado:
-        dispatch_webhook(destino.url, SECRETO, {"evento": "pago.aprobado"}, timeout=0.15)
+    with pytest.raises(WebhookDeliveryError) as raised:
+        dispatch_webhook(target.url, SECRET, {"evento": "pago.aprobado"}, timeout=0.15)
 
-    notas = "\n".join(capturado.value.__notes__)
+    notes = "\n".join(raised.value.__notes__)
 
-    assert "timeout_s" in notas, f"las notas no registran el timeout usado: {notas!r}"
+    assert "timeout_s" in notes, f"las notas no registran el timeout usado: {notes!r}"
 
 
-def test_el_worker_borra_el_mensaje_cuando_el_destino_confirma(destino, logger_pruebas):
+def test_worker_deletes_the_message_when_the_target_confirms(target, test_logger):
     """Con 2xx el mensaje se borra: ya no vuelve a la cola ni puede terminar en la DLQ."""
-    logger, _ = logger_pruebas
-    cliente = ClienteSQSFalso([_mensaje("msg-1", json.dumps({"evento": "pago.aprobado"}), "rh-1")])
-    worker = _worker(cliente, destino, logger)
+    logger, _ = test_logger
+    client = FakeSQSClient([_message("msg-1", json.dumps({"evento": "pago.aprobado"}), "rh-1")])
+    worker = _build_worker(client, target, logger)
 
-    assert worker.procesar_lote() == 1, "el mensaje confirmado no se contó como entregado"
-    assert len(cliente.borrados) == 1, "delete_message debe llamarse exactamente una vez"
-    assert cliente.borrados[0]["ReceiptHandle"] == "rh-1"
-    assert cliente.borrados[0]["QueueUrl"] == URL_COLA
-    assert worker.entregados == 1
-    assert worker.fallidos == 0
+    assert worker.process_batch() == 1, "el mensaje confirmado no se contó como entregado"
+    assert len(client.delete_calls) == 1, "delete_message debe llamarse exactamente una vez"
+    assert client.delete_calls[0]["ReceiptHandle"] == "rh-1"
+    assert client.delete_calls[0]["QueueUrl"] == QUEUE_URL
+    assert worker.delivered == 1
+    assert worker.failed == 0
 
 
-def test_el_worker_no_borra_cuando_el_destino_falla(destino, logger_pruebas):
+def test_worker_does_not_delete_when_the_target_fails(target, test_logger):
     """No borrar es lo que hace que SQS reintente y el RedrivePolicy derive a la DLQ (S9)."""
-    logger, _ = logger_pruebas
-    destino.status = 500
-    cliente = ClienteSQSFalso([_mensaje("msg-2", json.dumps({"evento": "pago.aprobado"}), "rh-2")])
-    worker = _worker(cliente, destino, logger)
+    logger, _ = test_logger
+    target.status = 500
+    client = FakeSQSClient([_message("msg-2", json.dumps({"evento": "pago.aprobado"}), "rh-2")])
+    worker = _build_worker(client, target, logger)
 
-    assert worker.procesar_lote() == 0
-    assert cliente.borrados == [], "un fallo de entrega no puede borrar el mensaje: se perdería la DLQ"
-    assert worker.fallidos == 1, "el fallo no se contabilizó"
-    assert worker.entregados == 0
+    assert worker.process_batch() == 0
+    assert client.delete_calls == [], "un fallo de entrega no puede borrar el mensaje: se perdería la DLQ"
+    assert worker.failed == 1, "el fallo no se contabilizó"
+    assert worker.delivered == 0
 
 
-def test_un_cuerpo_corrupto_no_aborta_el_lote_ni_se_borra(destino, logger_pruebas):
+def test_corrupted_body_does_not_abort_the_batch_and_is_not_deleted(target, test_logger):
     """Un mensaje venenoso queda en la cola sin impedir que el resto del lote se entregue."""
-    logger, _ = logger_pruebas
-    cliente = ClienteSQSFalso(
+    logger, _ = test_logger
+    client = FakeSQSClient(
         [
-            _mensaje("corrupto", "no es json", "rh-corrupto"),
-            _mensaje("valido", json.dumps({"evento": "pago.aprobado"}), "rh-valido"),
+            _message("corrupto", "no es json", "rh-corrupto"),
+            _message("valido", json.dumps({"evento": "pago.aprobado"}), "rh-valido"),
         ]
     )
-    worker = _worker(cliente, destino, logger)
+    worker = _build_worker(client, target, logger)
 
-    entregados = worker.procesar_lote()
+    delivered = worker.process_batch()
 
-    assert entregados == 1, "un cuerpo corrupto no debe abortar el lote completo"
-    assert [borrado["ReceiptHandle"] for borrado in cliente.borrados] == ["rh-valido"], (
+    assert delivered == 1, "un cuerpo corrupto no debe abortar el lote completo"
+    assert [deleted["ReceiptHandle"] for deleted in client.delete_calls] == ["rh-valido"], (
         "sólo se borra el mensaje entregado; el corrupto debe quedar para la DLQ"
     )
-    assert worker.fallidos == 1
+    assert worker.failed == 1
 
     # Mismo trato para un JSON válido que no es objeto: tampoco es un evento despachable.
-    cliente.pendientes = [
-        _mensaje("texto", '"texto"', "rh-texto"),
-        _mensaje("valido-2", json.dumps({"evento": "pago.rechazado"}), "rh-valido-2"),
+    client.pending = [
+        _message("texto", '"texto"', "rh-texto"),
+        _message("valido-2", json.dumps({"evento": "pago.rechazado"}), "rh-valido-2"),
     ]
-    cliente.borrados.clear()
+    client.delete_calls.clear()
 
-    assert worker.procesar_lote() == 1, "un JSON que no es objeto también debe aislarse, no abortar"
-    assert [borrado["ReceiptHandle"] for borrado in cliente.borrados] == ["rh-valido-2"]
+    assert worker.process_batch() == 1, "un JSON que no es objeto también debe aislarse, no abortar"
+    assert [deleted["ReceiptHandle"] for deleted in client.delete_calls] == ["rh-valido-2"]
 
 
-def test_el_worker_usa_long_polling_visibility_timeout_y_el_contador_de_reintentos(destino, logger_pruebas):
+def test_worker_uses_long_polling_visibility_timeout_and_retry_counter(target, test_logger):
     """La recepción configura la cola y el registro lleva correlación, reintentos y latencia."""
-    logger, registros = logger_pruebas
-    cliente = ClienteSQSFalso(
+    logger, records = test_logger
+    client = FakeSQSClient(
         [
-            _mensaje(
+            _message(
                 "msg-3",
                 json.dumps({"evento": "pago.aprobado"}),
                 "rh-3",
-                recepciones=3,
+                receive_count=3,
                 trace_id="trace-xyz",
             )
         ]
     )
-    worker = _worker(cliente, destino, logger, wait_time=7, visibility_timeout=45)
+    worker = _build_worker(client, target, logger, wait_time=7, visibility_timeout=45)
 
-    assert worker.procesar_lote() == 1
+    assert worker.process_batch() == 1
 
-    (recepcion,) = cliente.recepciones
-    assert recepcion["WaitTimeSeconds"] == 7, "la recepción no pidió long polling"
-    assert recepcion["VisibilityTimeout"] == 45, "la recepción no respetó el VisibilityTimeout de la cola"
-    assert recepcion["AttributeNames"] == ["ApproximateReceiveCount"], (
+    (receive_call,) = client.receive_count
+    assert receive_call["WaitTimeSeconds"] == 7, "la recepción no pidió long polling"
+    assert receive_call["VisibilityTimeout"] == 45, "la recepción no respetó el VisibilityTimeout de la cola"
+    assert receive_call["AttributeNames"] == ["ApproximateReceiveCount"], (
         "sin ApproximateReceiveCount no hay contador de reintentos que auditar"
     )
 
-    registro = registros[-1]
+    record = records[-1]
 
-    assert registro.getMessage() == "webhook entregado"
-    assert registro.trace_id == "trace-xyz"
-    assert registro.message_id == "msg-3"
-    assert registro.retry_count == 3, "retry_count debe salir del ApproximateReceiveCount"
-    assert isinstance(registro.latency_ms, float)
-    assert "retry_count" in CAMPOS_OPCIONALES
+    assert record.getMessage() == "webhook entregado"
+    assert record.trace_id == "trace-xyz"
+    assert record.message_id == "msg-3"
+    assert record.retry_count == 3, "retry_count debe salir del ApproximateReceiveCount"
+    assert isinstance(record.latency_ms, float)
+    assert "retry_count" in OPTIONAL_FIELDS
 
-    datos = json.loads(AsyncJSONFormatter().format(registro))
+    data = json.loads(AsyncJSONFormatter().format(record))
 
-    assert datos["retry_count"] == 3, "el formatter no emite retry_count aunque llegue por extra"
+    assert data["retry_count"] == 3, "el formatter no emite retry_count aunque llegue por extra"

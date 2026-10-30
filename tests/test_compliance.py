@@ -14,98 +14,98 @@ from pathlib import Path
 
 import pytest
 
-RAIZ = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]
 
 # BaseException y sus alias: capturarlos atrapa KeyboardInterrupt y SystemExit.
-PROHIBIDOS = {"BaseException", "BaseExceptionGroup", "GeneratorExit", "KeyboardInterrupt", "SystemExit"}
+FORBIDDEN_NAMES = {"BaseException", "BaseExceptionGroup", "GeneratorExit", "KeyboardInterrupt", "SystemExit"}
 
 # Un return/break/continue dentro de estas estructuras no sale del finally que lo contiene.
-NO_ATRAVIESA = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+BOUNDARY_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 
 
-def _archivos(carpeta: Path) -> list[Path]:
-    if not carpeta.is_dir():
+def _python_files(folder: Path) -> list[Path]:
+    if not folder.is_dir():
         return []
-    return sorted(carpeta.rglob("*.py"))
+    return sorted(folder.rglob("*.py"))
 
 
-def _arboles() -> list[tuple[Path, ast.Module]]:
-    rutas = _archivos(RAIZ / "src") + _archivos(RAIZ / "tests")
-    arboles = []
-    for ruta in rutas:
-        arboles.append((ruta, ast.parse(ruta.read_text(encoding="utf-8"), filename=str(ruta))))
-    return arboles
+def _parsed_trees() -> list[tuple[Path, ast.Module]]:
+    paths = _python_files(ROOT / "src") + _python_files(ROOT / "tests")
+    trees = []
+    for path in paths:
+        trees.append((path, ast.parse(path.read_text(encoding="utf-8"), filename=str(path))))
+    return trees
 
 
-def _nombres(nodo: ast.expr | None) -> set[str]:
+def _exception_names(node: ast.expr | None) -> set[str]:
     """Nombres de excepción capturados por un `except`, sea simple, tupla o atributo."""
-    if nodo is None:
+    if node is None:
         return set()
-    if isinstance(nodo, ast.Name):
-        return {nodo.id}
-    if isinstance(nodo, ast.Attribute):
-        return {nodo.attr}
-    if isinstance(nodo, ast.Tuple):
-        return set().union(*(_nombres(elemento) for elemento in nodo.elts))
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Tuple):
+        return set().union(*(_exception_names(element) for element in node.elts))
     return set()
 
 
-def _salidas_abruptas(cuerpo: list[ast.stmt]) -> list[ast.stmt]:
+def _abrupt_exits(body: list[ast.stmt]) -> list[ast.stmt]:
     """Sentencias `return`/`break`/`continue` alcanzables sin cruzar un def/class/lambda."""
-    encontradas = []
-    pendientes: list[ast.AST] = list(cuerpo)
-    while pendientes:
-        nodo = pendientes.pop()
-        if isinstance(nodo, (ast.Return, ast.Break, ast.Continue)):
-            encontradas.append(nodo)
+    found = []
+    pending: list[ast.AST] = list(body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.Return, ast.Break, ast.Continue)):
+            found.append(node)
             continue
-        if isinstance(nodo, NO_ATRAVIESA):
+        if isinstance(node, BOUNDARY_NODES):
             continue
-        pendientes.extend(ast.iter_child_nodes(nodo))
-    return encontradas
+        pending.extend(ast.iter_child_nodes(node))
+    return found
 
 
 @pytest.mark.parametrize(
-    ("descripcion", "detectar"),
+    ("description", "detects"),
     [
         (
             "except desnudo o que captura BaseException o sus alias",
-            lambda nodo: nodo.type is None or bool(_nombres(nodo.type) & PROHIBIDOS),
+            lambda node: node.type is None or bool(_exception_names(node.type) & FORBIDDEN_NAMES),
         ),
         (
             "except cuyo cuerpo es sólo pass (excepción silenciada)",
-            lambda nodo: len(nodo.body) == 1 and isinstance(nodo.body[0], ast.Pass),
+            lambda node: len(node.body) == 1 and isinstance(node.body[0], ast.Pass),
         ),
     ],
 )
-def test_criterio_1_prohibicion_de_baseexception(descripcion, detectar):
-    infracciones = [
-        f"{ruta.relative_to(RAIZ)}:{nodo.lineno}"
-        for ruta, arbol in _arboles()
-        for nodo in ast.walk(arbol)
-        if isinstance(nodo, ast.ExceptHandler) and detectar(nodo)
+def test_criterion_1_baseexception_prohibition(description, detects):
+    violations = [
+        f"{path.relative_to(ROOT)}:{node.lineno}"
+        for path, tree in _parsed_trees()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ExceptHandler) and detects(node)
     ]
-    assert not infracciones, f"Criterio 1 — {descripcion}: {infracciones}"
+    assert not violations, f"Criterio 1 — {description}: {violations}"
 
 
-def test_criterio_2_pep765_sin_salidas_abruptas_en_finally():
-    infracciones = []
-    for ruta, arbol in _arboles():
-        for nodo in ast.walk(arbol):
-            if not isinstance(nodo, (ast.Try, ast.TryStar)):
+def test_criterion_2_pep765_no_abrupt_exits_in_finally():
+    violations = []
+    for path, tree in _parsed_trees():
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Try, ast.TryStar)):
                 continue
-            for salida in _salidas_abruptas(nodo.finalbody):
-                infracciones.append(f"{ruta.relative_to(RAIZ)}:{salida.lineno} {type(salida).__name__}")
+            for exit_node in _abrupt_exits(node.finalbody):
+                violations.append(f"{path.relative_to(ROOT)}:{exit_node.lineno} {type(exit_node).__name__}")
 
-    assert not infracciones, f"Criterio 2 — PEP 765, salidas abruptas dentro de finally: {infracciones}"
+    assert not violations, f"Criterio 2 — PEP 765, salidas abruptas dentro de finally: {violations}"
 
 
-def test_criterio_1_las_excepciones_del_dominio_heredan_de_exception():
-    from vulcano_telemetry import exceptions as dominio
+def test_criterion_1_domain_exceptions_inherit_from_exception():
+    from vulcano_telemetry import exceptions as domain_module
 
-    violaciones = [
-        nombre
-        for nombre, objeto in vars(dominio).items()
-        if isinstance(objeto, type) and issubclass(objeto, BaseException) and not issubclass(objeto, Exception)
+    violations = [
+        name
+        for name, obj in vars(domain_module).items()
+        if isinstance(obj, type) and issubclass(obj, BaseException) and not issubclass(obj, Exception)
     ]
-    assert not violaciones, f"Criterio 1 — heredan de BaseException: {violaciones}"
+    assert not violations, f"Criterio 1 — heredan de BaseException: {violations}"
