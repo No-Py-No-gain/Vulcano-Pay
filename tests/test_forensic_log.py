@@ -12,9 +12,11 @@ import json
 import logging.handlers
 import threading
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from vulcano_telemetry.dispatcher import DespachadorSQS
 from vulcano_telemetry.logging_engine import (
     CAMPOS_FIJOS,
     CAMPOS_OPCIONALES,
@@ -203,3 +205,104 @@ def test_el_formatter_no_necesita_el_pipeline_para_formatear():
 
     assert datos["message"] == "suelto"
     assert set(CAMPOS_FIJOS) <= set(datos)
+
+
+class _DestinoQueFalla:
+    """Destino HTTP local que responde 500: fuerza el camino de fallo del despacho."""
+
+    def __init__(self) -> None:
+        destino = self
+        destino.peticiones = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                destino.peticiones += 1
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        self._servidor = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._servidor.server_port}/webhook"
+        self._hilo = threading.Thread(target=self._servidor.serve_forever, daemon=True)
+        self._hilo.start()
+
+    def cerrar(self) -> None:
+        self._servidor.shutdown()
+        self._servidor.server_close()
+
+
+@pytest.fixture
+def destino_que_falla():
+    destino = _DestinoQueFalla()
+    yield destino
+    destino.cerrar()
+
+
+class _SQSDeUnMensaje:
+    """Doble mínimo del cliente SQS: entrega un mensaje y registra los borrados."""
+
+    def __init__(self, mensaje: dict) -> None:
+        self._pendiente = mensaje
+        self.borrados: list[str] = []
+
+    def receive_message(self, **_kwargs: object) -> dict:
+        mensaje, self._pendiente = self._pendiente, None
+        return {"Messages": [mensaje]} if mensaje else {}
+
+    def delete_message(self, QueueUrl: str, ReceiptHandle: str) -> dict:
+        self.borrados.append(ReceiptHandle)
+        return {}
+
+
+def test_el_registro_de_un_despacho_real_conserva_traza_firma_y_latencia(tmp_path, destino_que_falla):
+    """S12 sobre el sistema: el registro lo produce el worker de verdad, no una llamada al formatter.
+
+    Se lee el archivo que quedó en disco —incluidos los respaldos comprimidos— y se comprueba que la
+    línea del despacho lleve TraceId, MessageId, el contador de reintentos y la cabecera
+    X-Webhook-Signature que se envió.
+    """
+    log = tmp_path / "despacho.log"
+    sesion = setup_vulcano_logging(log, max_bytes=700, backup_count=5)
+    mensaje = {
+        "MessageId": "msg-e2e",
+        "ReceiptHandle": "rh-e2e",
+        "Body": json.dumps({"transaction_id": "tx_e2e"}),
+        "Attributes": {"ApproximateReceiveCount": "2"},
+        "MessageAttributes": {
+            "TraceId": {"StringValue": "trace-e2e"},
+            "WebhookId": {"StringValue": "wh-e2e"},
+        },
+    }
+    despachador = DespachadorSQS(
+        cliente=_SQSDeUnMensaje(mensaje),
+        queue_url="http://localhost:4566/000000000000/cola-e2e",
+        target_url=destino_que_falla.url,
+        secret="secreto_de_prueba_de_16_mas",
+        logger=sesion.logger,
+        timeout=5.0,
+    )
+
+    assert despachador.procesar_lote() == 0, "un destino que responde 500 no puede contar como entrega"
+    for indice in range(6):
+        sesion.logger.info("relleno para forzar la rotación %s %s", indice, "y" * 60)
+    sesion.stop()
+
+    archivos = [*sorted(tmp_path.glob("despacho.log.*.gz")), log]
+    assert any(ruta.suffix == ".gz" for ruta in archivos), "no se generó ningún .log.gz del flujo real"
+
+    registros = [json.loads(linea) for ruta in archivos for linea in _leer(ruta)]
+    del_despacho = [registro for registro in registros if registro.get("message_id") == "msg-e2e"]
+
+    assert len(del_despacho) == 1, f"el despacho real no dejó exactamente un registro: {del_despacho}"
+    registro = del_despacho[0]
+    assert registro["trace_id"] == "trace-e2e", "el TraceId de SQS no llegó al registro"
+    assert registro["webhook_id"] == "wh-e2e", "el WebhookId del atributo no llegó al registro"
+    assert registro["retry_count"] == 2, "el contador de reintentos no llegó al registro"
+    assert isinstance(registro["latency_ms"], (int, float)), "la latencia de la entrega no quedó registrada"
+    notas = " ".join(registro.get("notes", []))
+    assert "X-Webhook-Signature=" in notas, f"el registro no conserva la firma enviada: {registro}"
+    assert registro["exception"]["type"] == "WebhookDeliveryError"
