@@ -33,122 +33,122 @@ from vulcano_telemetry.exceptions import (
     WebhookSignatureError,
     WebhookTimestampError,
 )
-from vulcano_telemetry.logging_engine import NOMBRE_LOGGER
+from vulcano_telemetry.logging_engine import LOGGER_NAME
 
-RAIZ = Path(__file__).resolve().parents[1]
-RUTA_CLI = RAIZ / "src" / "app_operator.py"
-URL_COLA = "http://localhost:4566/000000000000/vulcano-events-queue"
-SECRETO_VALIDO = "clave-secreta-de-prueba-suficientemente-larga"
-SUBCOMANDOS = ("produce-sqs", "start-receiver", "start-dispatcher")
+ROOT = Path(__file__).resolve().parents[1]
+CLI_PATH = ROOT / "src" / "app_operator.py"
+QUEUE_URL = "http://localhost:4566/000000000000/vulcano-events-queue"
+VALID_SECRET = "clave-secreta-de-prueba-suficientemente-larga"
+SUBCOMMANDS = ("produce-sqs", "start-receiver", "start-dispatcher")
 
 
-class ColectorDeRegistros(logging.Handler):
+class RecordCollector(logging.Handler):
     """Handler en memoria: deja ver los registros emitidos sin tocar el disco."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.registros: list[logging.LogRecord] = []
+        self.records: list[logging.LogRecord] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.registros.append(record)
+        self.records.append(record)
 
 
 @dataclass
-class PipelineObservado:
+class ObservedPipeline:
     """Lo que el test puede observar del pipeline de logging reemplazado."""
 
-    registros: list[logging.LogRecord]
-    configuraciones: list[dict[str, Any]]
-    apagados: list[int]
+    records: list[logging.LogRecord]
+    setups: list[dict[str, Any]]
+    shutdowns: list[int]
 
 
-class ClienteSQSConCola:
+class SQSClientWithQueue:
     """Doble de SQS: resuelve el nombre de la cola a una URL sin hablar con AWS."""
 
-    def __init__(self, url: str = URL_COLA) -> None:
+    def __init__(self, url: str = QUEUE_URL) -> None:
         self.url = url
-        self.pedidos: list[dict[str, Any]] = []
+        self.queue_url_calls: list[dict[str, Any]] = []
 
-    def get_queue_url(self, **argumentos: Any) -> dict[str, Any]:
-        self.pedidos.append(argumentos)
+    def get_queue_url(self, **arguments: Any) -> dict[str, Any]:
+        self.queue_url_calls.append(arguments)
         return {"QueueUrl": self.url}
 
 
-class ClienteSQSColaPerdida:
+class SQSClientMissingQueue:
     """Doble de SQS para la cola que no existe: Boto3 levanta `ClientError`."""
 
-    def get_queue_url(self, **_argumentos: Any) -> dict[str, Any]:
+    def get_queue_url(self, **_kwargs: Any) -> dict[str, Any]:
         raise ClientError(
             {"Error": {"Code": "AWS.SimpleQueueService.NonExistentQueue", "Message": "does not exist"}},
             "GetQueueUrl",
         )
 
 
-def _despachador_doble(monkeypatch, excepcion: type[BaseException] | None = None, llamadas: list[Any] | None = None):
+def _dispatcher_double(monkeypatch, exception: type[BaseException] | None = None, calls: list[Any] | None = None):
     """Reemplaza `DespachadorSQS` por un doble que registra su invocación y/o falla al ejecutar."""
 
-    class DespachadorDoble:
-        def __init__(self, cliente, queue_url, target_url, secret, logger=None, **opciones: Any) -> None:
-            self.invocacion = {
-                "cliente": cliente,
+    class DispatcherDouble:
+        def __init__(self, client, queue_url, target_url, secret, logger=None, **options: Any) -> None:
+            self.invocation = {
+                "client": client,
                 "queue_url": queue_url,
                 "target_url": target_url,
                 "secret": secret,
                 "logger": logger,
-                **opciones,
+                **options,
             }
-            if llamadas is not None:
-                llamadas.append(self.invocacion)
+            if calls is not None:
+                calls.append(self.invocation)
 
-        def ejecutar(self, iteraciones: int | None = None) -> int:
-            if llamadas is not None:
-                llamadas.append({"iteraciones": iteraciones})
-            if excepcion is not None:
-                raise excepcion("fallo simulado dentro del despachador")
+        def run(self, iterations: int | None = None) -> int:
+            if calls is not None:
+                calls.append({"iterations": iterations})
+            if exception is not None:
+                raise exception("fallo simulado dentro del despachador")
             return 0
 
-    monkeypatch.setattr(app_operator, "DespachadorSQS", DespachadorDoble)
+    monkeypatch.setattr(app_operator, "SQSDispatcher", DispatcherDouble)
 
 
 @pytest.fixture
 def pipeline(monkeypatch):
     """Pipeline de logging reemplazado: nada escribe archivos y todo registro queda observable."""
-    logger = logging.getLogger(NOMBRE_LOGGER)
+    logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.INFO)
     logger.propagate = False
     logger.handlers.clear()
-    colector = ColectorDeRegistros()
-    logger.addHandler(colector)
+    collector = RecordCollector()
+    logger.addHandler(collector)
 
-    configuraciones: list[dict[str, Any]] = []
-    apagados: list[int] = []
+    setups: list[dict[str, Any]] = []
+    shutdowns: list[int] = []
 
-    def setup_falso(log_file="vulcano_events.log", **_opciones: Any):
-        configuraciones.append({"log_file": str(log_file)})
+    def fake_setup(log_file="vulcano_events.log", **_options: Any):
+        setups.append({"log_file": str(log_file)})
         return object()
 
-    def shutdown_falso() -> None:
-        apagados.append(1)
+    def fake_shutdown() -> None:
+        shutdowns.append(1)
 
-    monkeypatch.setattr(app_operator, "setup_vulcano_logging", setup_falso)
-    monkeypatch.setattr(app_operator, "shutdown_vulcano_logging", shutdown_falso)
+    monkeypatch.setattr(app_operator, "setup_vulcano_logging", fake_setup)
+    monkeypatch.setattr(app_operator, "shutdown_vulcano_logging", fake_shutdown)
 
-    yield PipelineObservado(registros=colector.registros, configuraciones=configuraciones, apagados=apagados)
+    yield ObservedPipeline(records=collector.records, setups=setups, shutdowns=shutdowns)
 
-    logger.removeHandler(colector)
+    logger.removeHandler(collector)
     logger.handlers.clear()
 
 
-def test_el_help_lista_los_tres_subcomandos():
+def test_help_lists_the_three_subcommands():
     """S7: la ayuda del parser publica los tres subcomandos acordados."""
-    ayuda = app_operator.build_parser().format_help()
+    help_text = app_operator.build_parser().format_help()
 
-    for subcomando in SUBCOMANDOS:
-        assert subcomando in ayuda, f"la ayuda no documenta el subcomando {subcomando}"
-    assert "130" in ayuda, "la ayuda debe publicar la tabla de códigos de salida"
+    for subcommand in SUBCOMMANDS:
+        assert subcommand in help_text, f"la ayuda no documenta el subcomando {subcommand}"
+    assert "130" in help_text, "la ayuda debe publicar la tabla de códigos de salida"
 
 
-def test_sin_subcomando_termina_con_codigo_2(capsys):
+def test_missing_subcommand_exits_with_code_2(capsys):
     """Convención de `main()`: devuelve 2 en vez de dejar escapar el `SystemExit` de argparse."""
     assert app_operator.main(argv=[]) == 2
 
@@ -159,124 +159,124 @@ def test_sin_subcomando_termina_con_codigo_2(capsys):
     )
 
 
-def test_un_nombre_de_cola_invalido_termina_con_codigo_2(capsys, pipeline):
+def test_invalid_queue_name_exits_with_code_2(capsys, pipeline):
     """El sanitizador del rol 1 se integra como `type` de argparse y su mensaje llega al usuario."""
     assert app_operator.main(["produce-sqs", "-q", "cola-invalida"]) == 2
 
     error = capsys.readouterr().err
 
     assert "Nombre de cola inválido 'cola-invalida'" in error, f"falta el mensaje del sanitizador: {error!r}"
-    assert pipeline.apagados == [], "una validación de argparse no debe ni arrancar el pipeline"
+    assert pipeline.shutdowns == [], "una validación de argparse no debe ni arrancar el pipeline"
 
 
-def test_un_secreto_corto_termina_con_codigo_2(capsys, pipeline):
+def test_short_secret_exits_with_code_2(capsys, pipeline):
     """El sanitizador de la clave HMAC rechaza menos de 16 caracteres antes de tocar la red."""
     assert app_operator.main(["produce-sqs", "--secret", "corto"]) == 2
 
     error = capsys.readouterr().err
 
     assert "al menos 16 caracteres" in error, f"falta el mensaje del sanitizador: {error!r}"
-    assert pipeline.apagados == [], "una validación de argparse no debe ni arrancar el pipeline"
+    assert pipeline.shutdowns == [], "una validación de argparse no debe ni arrancar el pipeline"
 
 
-def test_importar_la_cli_no_escribe_ningun_archivo_de_log(tmp_path, monkeypatch):
+def test_importing_the_cli_writes_no_log_file(tmp_path, monkeypatch):
     """La observabilidad arranca en `main()`, nunca en el import del módulo."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("VULCANO_LOG_FILE", raising=False)
 
-    especificacion = importlib.util.spec_from_file_location("app_operator_import_aislado", RUTA_CLI)
-    modulo = importlib.util.module_from_spec(especificacion)
-    especificacion.loader.exec_module(modulo)
+    spec = importlib.util.spec_from_file_location("app_operator_import_aislado", CLI_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 
-    creados = sorted(ruta.name for ruta in tmp_path.iterdir())
+    created = sorted(path.name for path in tmp_path.iterdir())
 
-    assert creados == [], f"importar la CLI dejó archivos en el directorio de trabajo: {creados}"
-    assert callable(modulo.main)
+    assert created == [], f"importar la CLI dejó archivos en el directorio de trabajo: {created}"
+    assert callable(module.main)
 
 
-def test_produce_sqs_publica_y_devuelve_cero(pipeline, monkeypatch):
+def test_produce_sqs_publishes_and_returns_zero(pipeline, monkeypatch):
     """`produce-sqs` resuelve la URL con `get_queue_url`, publica y registra el MessageId devuelto."""
-    cliente = ClienteSQSConCola()
-    publicaciones: list[tuple[Any, str, dict[str, Any]]] = []
+    client = SQSClientWithQueue()
+    published: list[tuple[Any, str, dict[str, Any]]] = []
 
-    def produce_falso(cliente_recibido, url_cola, evento):
-        publicaciones.append((cliente_recibido, url_cola, evento))
+    def fake_produce(received_client, queue_url, event):
+        published.append((received_client, queue_url, event))
         return "msg-publicado-1"
 
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: cliente)
-    monkeypatch.setattr(app_operator, "produce_event", produce_falso)
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: client)
+    monkeypatch.setattr(app_operator, "produce_event", fake_produce)
 
     assert app_operator.main(["produce-sqs"]) == 0
 
-    assert cliente.pedidos == [{"QueueName": "vulcano-events-queue"}], (
+    assert client.queue_url_calls == [{"QueueName": "vulcano-events-queue"}], (
         "la URL de la cola se pide al servicio a partir del nombre, no se concatena a mano"
     )
-    assert len(publicaciones) == 1
-    _, url_cola, evento = publicaciones[0]
-    assert url_cola == URL_COLA
-    assert evento, "el payload por defecto debe traer un evento de ejemplo"
+    assert len(published) == 1
+    _, queue_url, event = published[0]
+    assert queue_url == QUEUE_URL
+    assert event, "el payload por defecto debe traer un evento de ejemplo"
 
-    registros = [
-        registro for registro in pipeline.registros if getattr(registro, "message_id", None) == "msg-publicado-1"
+    records = [
+        record for record in pipeline.records if getattr(record, "message_id", None) == "msg-publicado-1"
     ]
-    assert registros, "el MessageId devuelto por SQS no quedó registrado"
-    assert "msg-publicado-1" in registros[0].getMessage()
-    assert pipeline.apagados == [1], "el finally debe apagar el pipeline también en el camino feliz"
+    assert records, "el MessageId devuelto por SQS no quedó registrado"
+    assert "msg-publicado-1" in records[0].getMessage()
+    assert pipeline.shutdowns == [1], "el finally debe apagar el pipeline también en el camino feliz"
 
 
-def test_produce_sqs_inyecta_el_event_topic_en_el_evento(pipeline, monkeypatch):
+def test_produce_sqs_injects_the_event_topic_into_the_event(pipeline, monkeypatch):
     """`--event-topic` viaja en el cuerpo del evento y en el registro forense."""
-    eventos: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
 
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: ClienteSQSConCola())
-    monkeypatch.setattr(app_operator, "produce_event", lambda _c, _u, evento: eventos.append(evento) or "msg-tema")
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientWithQueue())
+    monkeypatch.setattr(app_operator, "produce_event", lambda _c, _u, event: events.append(event) or "msg-tema")
 
     assert app_operator.main(["produce-sqs", "--event-topic", "pago.aprobado"]) == 0
 
-    assert eventos == [{**app_operator.EVENTO_DE_EJEMPLO, "event_topic": "pago.aprobado"}]
-    registros = [registro for registro in pipeline.registros if getattr(registro, "message_id", None) == "msg-tema"]
-    assert registros and registros[0].event_topic == "pago.aprobado"
+    assert events == [{**app_operator.SAMPLE_EVENT, "event_topic": "pago.aprobado"}]
+    records = [record for record in pipeline.records if getattr(record, "message_id", None) == "msg-tema"]
+    assert records and records[0].event_topic == "pago.aprobado"
 
 
-def test_un_payload_que_no_es_json_termina_con_codigo_2(capsys, pipeline):
+def test_non_json_payload_exits_with_code_2(capsys, pipeline):
     """El payload inválido es validación de argumentos (código 2), no un error de SQS."""
     assert app_operator.main(["produce-sqs", "--payload", "{no es json}"]) == 2
 
     assert "Payload inválido" in capsys.readouterr().err
-    assert pipeline.apagados == []
+    assert pipeline.shutdowns == []
 
 
-def test_una_cola_inexistente_termina_con_codigo_4(pipeline, monkeypatch):
+def test_missing_queue_exits_with_code_4(pipeline, monkeypatch):
     """Que la cola no exista es un error de SQS: exit 4 con su log, no un traceback."""
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: ClienteSQSColaPerdida())
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientMissingQueue())
 
     assert app_operator.main(["produce-sqs"]) == 4
 
-    assert any(registro.levelno == logging.ERROR for registro in pipeline.registros)
-    assert pipeline.apagados == [1]
+    assert any(record.levelno == logging.ERROR for record in pipeline.records)
+    assert pipeline.shutdowns == [1]
 
 
-def test_start_receiver_levanta_uvicorn_con_el_app_del_receptor(pipeline, monkeypatch):
+def test_start_receiver_runs_uvicorn_with_the_receiver_app(pipeline, monkeypatch):
     """El receptor se levanta por la ruta de importación, para que uvicorn lo construya a demanda."""
-    invocaciones: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    invocations: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-    monkeypatch.setattr(app_operator.uvicorn, "run", lambda *args, **kwargs: invocaciones.append((args, kwargs)))
+    monkeypatch.setattr(app_operator.uvicorn, "run", lambda *args, **kwargs: invocations.append((args, kwargs)))
 
     assert app_operator.main(["start-receiver", "--host", "0.0.0.0", "--port", "9999"]) == 0
 
-    (args, kwargs) = invocaciones[0]
+    (args, kwargs) = invocations[0]
     assert args == ("vulcano_telemetry.webhook_receiver:app",)
     assert kwargs == {"host": "0.0.0.0", "port": 9999}
 
 
-def test_start_dispatcher_propaga_las_opciones_y_respeta_max_lotes(pipeline, monkeypatch):
+def test_start_dispatcher_propagates_options_and_honors_max_batches(pipeline, monkeypatch):
     """`--max-lotes` acota el bucle para que la demo sea determinista; el resto viaja al despachador."""
-    llamadas: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
 
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: ClienteSQSConCola())
-    _despachador_doble(monkeypatch, llamadas=llamadas)
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientWithQueue())
+    _dispatcher_double(monkeypatch, calls=calls)
 
-    codigo = app_operator.main(
+    exit_code = app_operator.main(
         [
             "start-dispatcher",
             "-q",
@@ -286,7 +286,7 @@ def test_start_dispatcher_propaga_las_opciones_y_respeta_max_lotes(pipeline, mon
             "--url",
             "https://ejemplo.test/webhook",
             "--secret",
-            SECRETO_VALIDO,
+            VALID_SECRET,
             "--timeout",
             "2.5",
             "--max-lotes",
@@ -294,65 +294,65 @@ def test_start_dispatcher_propaga_las_opciones_y_respeta_max_lotes(pipeline, mon
         ]
     )
 
-    assert codigo == 0
+    assert exit_code == 0
 
-    invocacion = llamadas[0]
-    assert invocacion["queue_url"] == URL_COLA
-    assert invocacion["target_url"] == "https://ejemplo.test/webhook"
-    assert invocacion["secret"] == SECRETO_VALIDO
-    assert invocacion["wait_time"] == 5
-    assert invocacion["timeout"] == 2.5
-    assert llamadas[1] == {"iteraciones": 2}, "el dosificador '--max-lotes' no llegó al bucle del despachador"
+    invocation = calls[0]
+    assert invocation["queue_url"] == QUEUE_URL
+    assert invocation["target_url"] == "https://ejemplo.test/webhook"
+    assert invocation["secret"] == VALID_SECRET
+    assert invocation["wait_time"] == 5
+    assert invocation["timeout"] == 2.5
+    assert calls[1] == {"iterations": 2}, "el dosificador '--max-lotes' no llegó al bucle del despachador"
 
 
 @pytest.mark.parametrize(
-    ("excepcion", "codigo"),
+    ("exception", "exit_code"),
     [
         (SQSConnectionError, 4),
         (WebhookDeliveryError, 5),
         (WebhookSignatureError, 3),
         (WebhookTimestampError, 3),
     ],
-    ids=["sqs", "entrega", "firma", "timestamp"],
+    ids=["sqs", "delivery", "signature", "timestamp"],
 )
-def test_cada_grupo_de_excepciones_mapea_su_codigo_de_salida(excepcion, codigo, pipeline, monkeypatch):
+def test_each_exception_group_maps_to_its_exit_code(exception, exit_code, pipeline, monkeypatch):
     """S7/S8: cada grupo de `except*` tiene su log y su código de salida."""
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: ClienteSQSConCola())
-    _despachador_doble(monkeypatch, excepcion=excepcion)
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientWithQueue())
+    _dispatcher_double(monkeypatch, exception=exception)
 
-    assert app_operator.main(["start-dispatcher"]) == codigo
+    assert app_operator.main(["start-dispatcher"]) == exit_code
 
-    errores = [registro for registro in pipeline.registros if registro.levelno == logging.ERROR]
-    assert errores, f"el grupo de {excepcion.__name__} no dejó registro de error"
-    assert any(registro.exc_info is not None for registro in errores), "el registro debe conservar el árbol del grupo"
+    errors = [record for record in pipeline.records if record.levelno == logging.ERROR]
+    assert errors, f"el grupo de {exception.__name__} no dejó registro de error"
+    assert any(record.exc_info is not None for record in errors), "el registro debe conservar el árbol del grupo"
 
 
-def test_la_interrupcion_por_ctrl_c_termina_en_130(pipeline, monkeypatch):
+def test_ctrl_c_interruption_exits_with_130(pipeline, monkeypatch):
     """Un Ctrl-C durante el despachador devuelve 130 sin propagar el traceback."""
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: ClienteSQSConCola())
-    _despachador_doble(monkeypatch, excepcion=KeyboardInterrupt)
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientWithQueue())
+    _dispatcher_double(monkeypatch, exception=KeyboardInterrupt)
 
     assert app_operator.main(["start-dispatcher"]) == 130
 
-    assert pipeline.apagados == [1], "el finally debe apagar el pipeline incluso con Ctrl-C"
+    assert pipeline.shutdowns == [1], "el finally debe apagar el pipeline incluso con Ctrl-C"
 
 
-def test_el_finally_apaga_el_pipeline_de_logging(pipeline, monkeypatch):
+def test_finally_shuts_down_the_logging_pipeline(pipeline, monkeypatch):
     """S8: el `finally` libera el listener aunque el camino termine en una excepción del dominio."""
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: ClienteSQSConCola())
-    _despachador_doble(monkeypatch, excepcion=WebhookDeliveryError)
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientWithQueue())
+    _dispatcher_double(monkeypatch, exception=WebhookDeliveryError)
 
     assert app_operator.main(["start-dispatcher"]) == 5
 
-    assert pipeline.apagados == [1], "shutdown_vulcano_logging debe llamarse exactamente una vez"
+    assert pipeline.shutdowns == [1], "shutdown_vulcano_logging debe llamarse exactamente una vez"
 
 
-def test_el_log_file_por_defecto_sale_de_la_variable_de_entorno(pipeline, monkeypatch, tmp_path):
+def test_default_log_file_comes_from_the_environment_variable(pipeline, monkeypatch, tmp_path):
     """`--log-file` toma su valor de `VULCANO_LOG_FILE` cuando el operador no lo pasa."""
     monkeypatch.setenv("VULCANO_LOG_FILE", str(tmp_path / "registro.jsonl"))
-    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: ClienteSQSConCola())
-    _despachador_doble(monkeypatch)
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientWithQueue())
+    _dispatcher_double(monkeypatch)
 
     assert app_operator.main(["start-dispatcher"]) == 0
 
-    assert pipeline.configuraciones[0]["log_file"] == str(tmp_path / "registro.jsonl")
+    assert pipeline.setups[0]["log_file"] == str(tmp_path / "registro.jsonl")
