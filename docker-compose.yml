@@ -1,0 +1,18 @@
+services:
+  localstack:
+    image: localstack/localstack:4
+    container_name: vulcano-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      # Sólo SQS: el resto de los servicios emulados no se usan en este trabajo.
+      SERVICES: sqs
+      DEBUG: "0"
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      # Los volúmenes de la cátedra se mantienen entre reinicios para no recrear colas.
+      - localstack-data:/var/lib/localstack
+    restart: unless-stopped
+
+volumes:
+  localstack-data:
