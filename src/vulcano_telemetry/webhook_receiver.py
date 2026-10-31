@@ -1,37 +1,155 @@
-"""Servidor HTTP Receptor de Webhooks utilizando FastAPI y Boto3 LocalStack."""
 
+"""
+Proyecto Vulcano Pay
+Modulo: webhook_receiver.py
+Responsabilidad: Integrante 3
+
+Servidor HTTP receptor de webhooks con FastAPI.
+Verifica HMAC-SHA256 y publica eventos en SQS.
+"""
+
+import json
 import logging
-from fastapi import FastAPI, Request, HTTPException, status
+import os
+from contextlib import asynccontextmanager
+from botocore.exceptions import BotoCoreError, ClientError
+
+from fastapi import FastAPI, HTTPException, Request, status
+from starlette.concurrency import run_in_threadpool
+
+from .core_sqs import get_sqs_client, send_event
+from .exceptions import (
+    SQSConnectionError,
+    WebhookSignatureError,
+    WebhookTimestampError,
+)
 from .webhook_crypto import verify_signature
-from .core_sqs import get_sqs_client, produce_event
-from .exceptions import WebhookSignatureError, WebhookTimestampError
 
 logger = logging.getLogger("vulcano_engine")
-app = FastAPI(title="Vulcano Webhook Receiver")
 
-WEBHOOK_SECRET = "mi_clave_secreta_super_segura_vulcano_123"
-QUEUE_URL = "http://localhost:4566/000000000000/vulcano-events-queue"
-sqs_client = get_sqs_client()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Inicializa SQS y obtiene la URL de la cola una vez."""
+
+    sqs_client = get_sqs_client(
+        os.getenv("LOCALSTACK_ENDPOINT", "http://localhost:4566")
+    )
+
+    try:
+        queue_name = os.getenv(
+            "VULCANO_QUEUE_NAME",
+            "vulcano-events-queue",
+        )
+
+        queue_response = await run_in_threadpool(
+            sqs_client.get_queue_url,
+            QueueName=queue_name,
+        )
+
+        app.state.sqs_client = sqs_client
+        app.state.queue_url = queue_response["QueueUrl"]
+
+        logger.info("Conexion SQS inicializada")
+
+        yield
+
+    finally:
+        sqs_client.close()
+
+
+
+app = FastAPI(
+    title="Vulcano Pay - Webhook Receiver",
+    lifespan=lifespan,
+)
+
 
 @app.post("/webhook", status_code=status.HTTP_202_ACCEPTED)
 async def receive_webhook(request: Request):
     """
-    Endpoint receptor de Webhooks:
-    1. Lee raw body bytes.
-    2. Valida la firma HMAC y Timestamp.
-    3. Responde HTTP 202 y encola en LocalStack SQS vía Boto3.
+    Recibe un webhook firmado.
+
+    1. Lee los bytes originales.
+    2. Verifica timestamp y firma HMAC.
+    3. Valida el JSON.
+    4. Publica el evento en SQS.
+    5. Devuelve HTTP 202.
     """
-    raw_bytes = await request.body()
-    signature_header = request.headers.get("X-Webhook-Signature", "")
+
+    secret = os.getenv("VULCANO_WEBHOOK_SECRET")
+
+    if not secret or len(secret) < 16:
+        logger.error("Clave HMAC no configurada correctamente")
+        raise HTTPException(
+            status_code=503,
+            detail="Servicio no configurado.",
+        )
+
+    raw_body = await request.body()
+
+    signature_header = request.headers.get(
+        "X-Webhook-Signature", ""
+    )
 
     try:
-        verify_signature(WEBHOOK_SECRET, signature_header, raw_bytes)
-    except (WebhookSignatureError, WebhookTimestampError) as err:
-        logger.warning(f"Rechazado Webhook no autenticado: {err}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(err))
+        verify_signature(
+            secret=secret,
+            header_value=signature_header,
+            payload_bytes=raw_body,
+        )
 
-    payload = await request.json()
-    msg_id = produce_event(sqs_client, QUEUE_URL, payload)
-    
-    logger.info(f"Webhook verificado y encolado exitosamente en SQS. MessageId: {msg_id}")
-    return {"status": "accepted", "message_id": msg_id}
+    except (WebhookSignatureError, WebhookTimestampError) as error:
+        logger.warning(
+            "Webhook rechazado: %s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Firma o timestamp invalido.",
+        ) from error
+
+    try:
+        payload = json.loads(raw_body)
+
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail="JSON invalido.",
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="El evento debe ser un objeto JSON.",
+        )
+
+    try:
+        sqs_client = request.app.state.sqs_client
+        queue_url = request.app.state.queue_url
+
+        message_id = await run_in_threadpool(
+            send_event,
+            sqs_client,
+            queue_url,
+            payload,
+            event_topic=payload.get(
+                "event_type", "payment.event"
+            ),
+        )
+
+    except (SQSConnectionError, BotoCoreError, ClientError) as error:
+        logger.error(
+            "Error de comunicacion con SQS",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Servicio de mensajeria no disponible.",
+        ) from error
+
+    return {
+        "status": "accepted",
+        "message_id": message_id,
+    }
