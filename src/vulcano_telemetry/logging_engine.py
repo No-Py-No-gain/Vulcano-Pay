@@ -4,7 +4,7 @@ Contrato del registro (lo valida `tests/test_forensic_log.py`):
 
 - campos fijos: `timestamp`, `level`, `logger`, `message`, `process`, `thread_name`;
 - campos opcionales, sólo si llegan por `extra`: `trace_id`, `message_id`, `webhook_id`,
-  `event_topic`, `signature`, `latency_ms`, `notes`;
+  `event_topic`, `signature`, `latency_ms`, `retry_count`, `notes`;
 - campos de excepción: `exception` (árbol recursivo de `ExceptionGroup` con sus notas y su cadena
   de causalidad) y `traceback` en texto.
 
@@ -37,6 +37,7 @@ CAMPOS_OPCIONALES = (
     "event_topic",
     "signature",
     "latency_ms",
+    "retry_count",
     "notes",
 )
 
