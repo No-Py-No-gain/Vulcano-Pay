@@ -180,11 +180,14 @@ class DespachadorSQS:
     def _contexto(self, mensaje: dict[str, Any]) -> dict[str, Any]:
         atributos = mensaje.get("MessageAttributes") or {}
         traza = (atributos.get("TraceId") or {}).get("StringValue")
+        webhook = (atributos.get("WebhookId") or {}).get("StringValue")
         message_id = mensaje.get("MessageId", "desconocido")
         recepciones = (mensaje.get("Attributes") or {}).get("ApproximateReceiveCount", "1")
         return {
             "trace_id": traza or message_id,
             "message_id": message_id,
+            # El formatter descarta los valores None: el campo sólo aparece si el emisor lo envió.
+            "webhook_id": webhook,
             "retry_count": int(recepciones),
         }
 
@@ -216,13 +219,19 @@ class DespachadorSQS:
             self.fallidos += 1
             return False
 
+        inicio = time.perf_counter()
         try:
             resultado = dispatch_webhook(self.target_url, self.secret, cuerpo, timeout=self.timeout)
         except WebhookDeliveryError as err:
+            latencia_ms = (time.perf_counter() - inicio) * 1000
             self.logger.error(
                 "entrega fallida; el mensaje queda en la cola para el reintento de SQS",
                 exc_info=err,
-                extra={**contexto, "notes": list(getattr(err, "__notes__", ()))},
+                extra={
+                    **contexto,
+                    "latency_ms": round(latencia_ms, 1),
+                    "notes": list(getattr(err, "__notes__", ())),
+                },
             )
             self.fallidos += 1
             return False
