@@ -1,0 +1,4 @@
+# Dependencias de desarrollo. requirements.txt queda con los 5 paquetes obligatorios
+# que exige la cátedra en la sección 2.1.1 del enunciado.
+pytest>=8
+ruff>=0.8
