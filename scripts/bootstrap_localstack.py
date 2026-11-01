@@ -46,16 +46,16 @@ def build_client():
 
 def wait_until_ready(client, timeout: float = READY_TIMEOUT) -> None:
     """Espera a que LocalStack acepte llamadas SQS. Falla con TimeoutError si no responde."""
-    limite = time.monotonic() + timeout
-    ultimo_error: Exception | None = None
-    while time.monotonic() < limite:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
         try:
             client.list_queues()
             return
         except (BotoCoreError, ClientError) as err:
-            ultimo_error = err
+            last_error = err
             time.sleep(RETRY_INTERVAL)
-    raise TimeoutError(f"LocalStack no respondió en {timeout}s: {ultimo_error}")
+    raise TimeoutError(f"LocalStack no respondió en {timeout}s: {last_error}")
 
 
 def ensure_queue(client, name: str, attributes: dict[str, str]) -> str:
@@ -79,17 +79,17 @@ def main() -> int:
     try:
         wait_until_ready(client)
 
-        attrs_comunes = {"VisibilityTimeout": str(VISIBILITY_TIMEOUT)}
-        dlq_url = ensure_queue(client, DLQ_NAME, attrs_comunes)
+        common_attributes = {"VisibilityTimeout": str(VISIBILITY_TIMEOUT)}
+        dlq_url = ensure_queue(client, DLQ_NAME, common_attributes)
         dlq_arn = queue_arn(client, dlq_url)
 
         redrive = json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": str(MAX_RECEIVE_COUNT)})
-        attrs_principales = {**attrs_comunes, "RedrivePolicy": redrive}
-        queue_url = ensure_queue(client, QUEUE_NAME, attrs_principales)
+        main_attributes = {**common_attributes, "RedrivePolicy": redrive}
+        queue_url = ensure_queue(client, QUEUE_NAME, main_attributes)
 
         # Reconciliación explícita: si las colas ya existían con otra configuración, se corrige.
-        client.set_queue_attributes(QueueUrl=dlq_url, Attributes=attrs_comunes)
-        client.set_queue_attributes(QueueUrl=queue_url, Attributes=attrs_principales)
+        client.set_queue_attributes(QueueUrl=dlq_url, Attributes=common_attributes)
+        client.set_queue_attributes(QueueUrl=queue_url, Attributes=main_attributes)
 
         print(
             json.dumps(

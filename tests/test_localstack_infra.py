@@ -21,14 +21,14 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-RAIZ = Path(__file__).resolve().parents[1]
-BOOTSTRAP = RAIZ / "scripts" / "bootstrap_localstack.py"
+ROOT = Path(__file__).resolve().parents[1]
+BOOTSTRAP = ROOT / "scripts" / "bootstrap_localstack.py"
 ENDPOINT_URL = os.getenv("VULCANO_ENDPOINT_URL", "http://localhost:4566")
 QUEUE_NAME = os.getenv("VULCANO_QUEUE_NAME", "vulcano-events-queue")
 DLQ_NAME = os.getenv("VULCANO_DLQ_NAME", "vulcano-events-dlq")
 MAX_RECEIVE_COUNT = os.getenv("VULCANO_MAX_RECEIVE_COUNT", "3")
 
-def _cliente():
+def _client():
     return boto3.client(
         "sqs",
         endpoint_url=ENDPOINT_URL,
@@ -38,7 +38,7 @@ def _cliente():
     )
 
 
-def _correr_bootstrap() -> subprocess.CompletedProcess:
+def _run_bootstrap() -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(BOOTSTRAP)],
         capture_output=True,
@@ -49,76 +49,76 @@ def _correr_bootstrap() -> subprocess.CompletedProcess:
     )
 
 
-def _atributos(cliente, nombre: str) -> tuple[str, dict[str, str]]:
-    url = cliente.get_queue_url(QueueName=nombre)["QueueUrl"]
-    attrs = cliente.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])["Attributes"]
-    return url, attrs
+def _queue_attributes(client, name: str) -> tuple[str, dict[str, str]]:
+    url = client.get_queue_url(QueueName=name)["QueueUrl"]
+    attributes = client.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])["Attributes"]
+    return url, attributes
 
 
 @pytest.fixture(scope="module")
-def bootstrapeado():
-    primera = _correr_bootstrap()
-    assert primera.returncode == 0, f"bootstrap falló: {primera.stderr}"
-    yield primera
+def bootstrapped():
+    first = _run_bootstrap()
+    assert first.returncode == 0, f"bootstrap falló: {first.stderr}"
+    yield first
     # Segunda corrida: debe ser idempotente y no ensuciar el estado.
-    segunda = _correr_bootstrap()
-    assert segunda.returncode == 0, f"bootstrap no es idempotente: {segunda.stderr}"
+    second = _run_bootstrap()
+    assert second.returncode == 0, f"bootstrap no es idempotente: {second.stderr}"
 
 
 @pytest.mark.integration
-def test_la_dlq_y_la_cola_principal_existen(bootstrapeado):
-    cliente = _cliente()
+def test_the_dlq_and_the_main_queue_exist(bootstrapped):
+    client = _client()
 
-    _, attrs_dlq = _atributos(cliente, DLQ_NAME)
-    _, attrs_cola = _atributos(cliente, QUEUE_NAME)
+    _, dlq_attributes = _queue_attributes(client, DLQ_NAME)
+    _, queue_attributes = _queue_attributes(client, QUEUE_NAME)
 
-    assert attrs_dlq["QueueArn"] != attrs_cola["QueueArn"]
+    assert dlq_attributes["QueueArn"] != queue_attributes["QueueArn"]
 
 
 @pytest.mark.integration
-def test_la_cola_principal_deriva_a_la_dlq_con_el_max_receive_count_configurado(bootstrapeado):
-    cliente = _cliente()
+def test_main_queue_redrives_to_the_dlq_with_the_configured_max_receive_count(bootstrapped):
+    client = _client()
 
-    _, attrs_dlq = _atributos(cliente, DLQ_NAME)
-    _, attrs_cola = _atributos(cliente, QUEUE_NAME)
+    _, dlq_attributes = _queue_attributes(client, DLQ_NAME)
+    _, queue_attributes = _queue_attributes(client, QUEUE_NAME)
 
-    assert "RedrivePolicy" in attrs_cola, (
+    assert "RedrivePolicy" in queue_attributes, (
         "la cola principal no tiene RedrivePolicy: los mensajes venenosos nunca llegan a la DLQ"
     )
-    redrive = json.loads(attrs_cola["RedrivePolicy"])
-    assert redrive["deadLetterTargetArn"] == attrs_dlq["QueueArn"]
+    redrive = json.loads(queue_attributes["RedrivePolicy"])
+    assert redrive["deadLetterTargetArn"] == dlq_attributes["QueueArn"]
     assert str(redrive["maxReceiveCount"]) == str(MAX_RECEIVE_COUNT)
 
 
 @pytest.mark.integration
-def test_el_bootstrap_es_idempotente(bootstrapeado):
-    cliente = _cliente()
+def test_bootstrap_is_idempotent(bootstrapped):
+    client = _client()
 
-    _, antes_cola = _atributos(cliente, QUEUE_NAME)
-    _, antes_dlq = _atributos(cliente, DLQ_NAME)
-    segunda = _correr_bootstrap()
+    _, queue_before = _queue_attributes(client, QUEUE_NAME)
+    _, dlq_before = _queue_attributes(client, DLQ_NAME)
+    second = _run_bootstrap()
 
-    assert segunda.returncode == 0, segunda.stderr
-    _, despues_cola = _atributos(cliente, QUEUE_NAME)
-    _, despues_dlq = _atributos(cliente, DLQ_NAME)
+    assert second.returncode == 0, second.stderr
+    _, queue_after = _queue_attributes(client, QUEUE_NAME)
+    _, dlq_after = _queue_attributes(client, DLQ_NAME)
 
-    assert (antes_cola["QueueArn"], antes_dlq["QueueArn"]) == (despues_cola["QueueArn"], despues_dlq["QueueArn"])
-    assert json.loads(despues_cola["RedrivePolicy"])["maxReceiveCount"] == str(MAX_RECEIVE_COUNT)
+    assert (queue_before["QueueArn"], dlq_before["QueueArn"]) == (queue_after["QueueArn"], dlq_after["QueueArn"])
+    assert json.loads(queue_after["RedrivePolicy"])["maxReceiveCount"] == str(MAX_RECEIVE_COUNT)
 
 
 @pytest.mark.integration
-def test_la_dlq_no_tiene_redrive_propio(bootstrapeado):
+def test_the_dlq_has_no_redrive_of_its_own(bootstrapped):
     """Una DLQ que deriva a otra cola indica una configuración circular: no debe existir."""
-    cliente = _cliente()
+    client = _client()
 
-    _, attrs_dlq = _atributos(cliente, DLQ_NAME)
+    _, dlq_attributes = _queue_attributes(client, DLQ_NAME)
 
-    assert "RedrivePolicy" not in attrs_dlq
+    assert "RedrivePolicy" not in dlq_attributes
 
 
-def test_sin_localstack_el_bootstrap_falla_con_codigo_4(tmp_path):
+def test_bootstrap_fails_with_code_4_without_localstack(tmp_path):
     """Control negativo: con el endpoint caído el script informa el fallo, no se cuelga ni miente."""
-    resultado = subprocess.run(
+    result = subprocess.run(
         [sys.executable, str(BOOTSTRAP)],
         capture_output=True,
         text=True,
@@ -131,15 +131,15 @@ def test_sin_localstack_el_bootstrap_falla_con_codigo_4(tmp_path):
         },
     )
 
-    assert resultado.returncode == 4
-    assert "ERROR" in resultado.stderr
+    assert result.returncode == 4
+    assert "ERROR" in result.stderr
 
 
-def test_el_cliente_sqs_reporta_error_de_conexion_sin_endpoint_levantado():
+def test_sqs_client_reports_connection_error_without_endpoint():
     """Boto3 contra un puerto cerrado levanta ClientError/BotoCoreError, no una excepción genérica."""
     from botocore.exceptions import BotoCoreError
 
-    cliente = boto3.client(
+    client = boto3.client(
         "sqs",
         endpoint_url="http://127.0.0.1:4567",
         region_name="us-east-1",
@@ -149,4 +149,4 @@ def test_el_cliente_sqs_reporta_error_de_conexion_sin_endpoint_levantado():
     )
 
     with pytest.raises((ClientError, BotoCoreError)):
-        cliente.list_queues()
+        client.list_queues()

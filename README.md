@@ -15,7 +15,7 @@ flowchart LR
     R -->|"HMAC sobre bytes crudos<br/>+ ventana de timestamp"| R
     R -->|"válido: send_message"| Q[("vulcano-events-queue")]
     R -->|"rechazo 401 / 403"| C
-    Q -->|"long polling"| W["DespachadorSQS"]
+    Q -->|"long polling"| W["SQSDispatcher"]
     W -->|"dispatch_webhook<br/>firma + POST"| D["Destino del cliente"]
     D -->|"2xx"| W
     W -->|"delete_message"| Q

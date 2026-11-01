@@ -16,10 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from vulcano_telemetry.dispatcher import DespachadorSQS
+from vulcano_telemetry.dispatcher import SQSDispatcher
 from vulcano_telemetry.logging_engine import (
-    CAMPOS_FIJOS,
-    CAMPOS_OPCIONALES,
+    FIXED_FIELDS,
+    OPTIONAL_FIELDS,
     AsyncJSONFormatter,
     setup_vulcano_logging,
     shutdown_vulcano_logging,
@@ -27,51 +27,51 @@ from vulcano_telemetry.logging_engine import (
 
 
 @pytest.fixture(autouse=True)
-def _cerrar_pipelines():
+def _close_pipelines():
     """Ninguna prueba deja un QueueListener vivo entre casos."""
     yield
     shutdown_vulcano_logging()
 
 
-def _leer(ruta) -> list[str]:
+def _read_lines(path) -> list[str]:
     """Líneas crudas de un archivo de log, esté comprimido o no."""
-    if ruta.suffix == ".gz":
-        with gzip.open(ruta, "rt", encoding="utf-8") as archivo:
-            return [linea for linea in archivo.read().splitlines() if linea]
-    return [linea for linea in ruta.read_text(encoding="utf-8").splitlines() if linea]
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            return [line for line in handle.read().splitlines() if line]
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
-def _registros(ruta) -> list[dict]:
-    return [json.loads(linea) for linea in _leer(ruta)]
+def _read_records(path) -> list[dict]:
+    return [json.loads(line) for line in _read_lines(path)]
 
 
-def test_cada_linea_es_json_con_campos_fijos_y_timestamp_utc(tmp_path):
+def test_each_line_is_json_with_fixed_fields_and_utc_timestamp(tmp_path):
     log = tmp_path / "forense.log"
-    sesion = setup_vulcano_logging(log)
+    session = setup_vulcano_logging(log)
 
-    sesion.logger.info("primer evento")
-    sesion.logger.warning("segundo evento")
-    sesion.stop()
+    session.logger.info("primer evento")
+    session.logger.warning("segundo evento")
+    session.stop()
 
-    registros = _registros(log)
+    records = _read_records(log)
 
-    assert len(registros) == 2
-    for registro in registros:
-        assert set(CAMPOS_FIJOS) <= set(registro)
-        marca = datetime.fromisoformat(registro["timestamp"])
-        assert marca.tzinfo is not None, "la marca de tiempo no declara zona horaria"
-        assert marca.utcoffset() == timedelta(0), "la marca de tiempo no está en UTC"
-        assert registro["timestamp"].endswith("+00:00")
+    assert len(records) == 2
+    for record in records:
+        assert set(FIXED_FIELDS) <= set(record)
+        timestamp = datetime.fromisoformat(record["timestamp"])
+        assert timestamp.tzinfo is not None, "la marca de tiempo no declara zona horaria"
+        assert timestamp.utcoffset() == timedelta(0), "la marca de tiempo no está en UTC"
+        assert record["timestamp"].endswith("+00:00")
 
-    assert [r["level"] for r in registros] == ["INFO", "WARNING"]
-    assert registros[0]["timestamp"] <= registros[1]["timestamp"]
+    assert [r["level"] for r in records] == ["INFO", "WARNING"]
+    assert records[0]["timestamp"] <= records[1]["timestamp"]
 
 
-def test_los_campos_de_correlacion_salen_de_extra_y_no_se_inventan(tmp_path):
+def test_correlation_fields_come_from_extra_and_are_not_invented(tmp_path):
     log = tmp_path / "forense.log"
-    sesion = setup_vulcano_logging(log)
+    session = setup_vulcano_logging(log)
 
-    sesion.logger.info(
+    session.logger.info(
         "webhook despachado",
         extra={
             "trace_id": "trace-abc",
@@ -81,117 +81,117 @@ def test_los_campos_de_correlacion_salen_de_extra_y_no_se_inventan(tmp_path):
             "latency_ms": 42.5,
         },
     )
-    sesion.logger.info("evento sin correlación")
-    sesion.stop()
+    session.logger.info("evento sin correlación")
+    session.stop()
 
-    con_correlacion, sin_correlacion = _registros(log)
+    with_correlation, without_correlation = _read_records(log)
 
-    assert con_correlacion["trace_id"] == "trace-abc"
-    assert con_correlacion["message_id"] == "msg-123"
-    assert con_correlacion["webhook_id"] == "wh-9"
-    assert con_correlacion["signature"] == "t=1700000000,v1=deadbeef"
-    assert con_correlacion["latency_ms"] == 42.5
+    assert with_correlation["trace_id"] == "trace-abc"
+    assert with_correlation["message_id"] == "msg-123"
+    assert with_correlation["webhook_id"] == "wh-9"
+    assert with_correlation["signature"] == "t=1700000000,v1=deadbeef"
+    assert with_correlation["latency_ms"] == 42.5
 
-    for campo in CAMPOS_OPCIONALES:
-        assert campo not in sin_correlacion, f"el formatter inventó el campo '{campo}' que no estaba en extra"
+    for field in OPTIONAL_FIELDS:
+        assert field not in without_correlation, f"el formatter inventó el campo '{field}' que no estaba en extra"
 
 
-def test_un_exception_group_se_serializa_como_arbol_con_sus_notas(tmp_path):
+def test_exception_group_is_serialized_as_a_tree_with_notes(tmp_path):
     log = tmp_path / "forense.log"
-    sesion = setup_vulcano_logging(log)
+    session = setup_vulcano_logging(log)
 
     try:
         raise ExceptionGroup("lote fallido", [ValueError("firma inválida"), RuntimeError("SQS caído")])
-    except ExceptionGroup as grupo:
-        grupo.exceptions[0].add_note("verificar X-Webhook-Signature")
-        grupo.exceptions[1].add_note("revisar LocalStack:4566")
-        sesion.logger.error("fallo al procesar el lote", exc_info=grupo)
-    sesion.stop()
+    except ExceptionGroup as group:
+        group.exceptions[0].add_note("verificar X-Webhook-Signature")
+        group.exceptions[1].add_note("revisar LocalStack:4566")
+        session.logger.error("fallo al procesar el lote", exc_info=group)
+    session.stop()
 
-    registro, = _registros(log)
-    arbol = registro["exception"]
+    record, = _read_records(log)
+    tree = record["exception"]
 
-    assert arbol["type"] == "ExceptionGroup"
+    assert tree["type"] == "ExceptionGroup"
     # str() de la stdlib agrega el conteo: "lote fallido (2 sub-exceptions)".
-    assert arbol["message"].startswith("lote fallido")
-    assert "2 sub-exceptions" in arbol["message"]
-    assert len(arbol["exceptions"]) == 2
-    assert arbol["exceptions"][0]["type"] == "ValueError"
-    assert arbol["exceptions"][0]["notes"] == ["verificar X-Webhook-Signature"]
-    assert arbol["exceptions"][1]["notes"] == ["revisar LocalStack:4566"]
-    assert "Traceback" in registro["traceback"]
+    assert tree["message"].startswith("lote fallido")
+    assert "2 sub-exceptions" in tree["message"]
+    assert len(tree["exceptions"]) == 2
+    assert tree["exceptions"][0]["type"] == "ValueError"
+    assert tree["exceptions"][0]["notes"] == ["verificar X-Webhook-Signature"]
+    assert tree["exceptions"][1]["notes"] == ["revisar LocalStack:4566"]
+    assert "Traceback" in record["traceback"]
 
 
-def test_la_rotacion_comprime_a_gzip_sin_perdida_de_datos(tmp_path):
+def test_rotation_compresses_to_gzip_without_data_loss(tmp_path):
     log = tmp_path / "rotado.log"
-    sesion = setup_vulcano_logging(log, max_bytes=2048, backup_count=5)
+    session = setup_vulcano_logging(log, max_bytes=2048, backup_count=5)
 
-    emitidos = 30
-    for indice in range(emitidos):
-        sesion.logger.info("evento %d %s", indice, "x" * 40)
-    sesion.stop()
+    emitted_count = 30
+    for index in range(emitted_count):
+        session.logger.info("evento %d %s", index, "x" * 40)
+    session.stop()
 
-    comprimidos = sorted(tmp_path.glob("rotado.log.*.gz"))
-    assert comprimidos, "no se generó ningún respaldo comprimido"
+    compressed = sorted(tmp_path.glob("rotado.log.*.gz"))
+    assert compressed, "no se generó ningún respaldo comprimido"
     assert not list(tmp_path.glob("*.tmp")), "quedó un temporal de compresión sin reemplazar"
 
-    lineas = []
-    for ruta in [*comprimidos, log]:
-        lineas.extend(_leer(ruta))
+    lines = []
+    for path in [*compressed, log]:
+        lines.extend(_read_lines(path))
 
-    assert len(lineas) == emitidos, f"se perdieron registros: {len(lineas)} de {emitidos}"
-    assert all(json.loads(linea) for linea in lineas)
+    assert len(lines) == emitted_count, f"se perdieron registros: {len(lines)} de {emitted_count}"
+    assert all(json.loads(line) for line in lines)
 
 
-def test_la_escritura_ocurre_en_el_hilo_del_listener_y_no_en_el_que_loguea(tmp_path):
+def test_writes_happen_in_the_listener_thread_not_the_logging_one(tmp_path):
     log = tmp_path / "hilos.log"
-    sesion = setup_vulcano_logging(log)
+    session = setup_vulcano_logging(log)
 
-    hilos_de_escritura: list[str] = []
-    emit_original = sesion.handler_archivo.emit
+    writing_threads: list[str] = []
+    original_emit = session.file_handler.emit
 
-    def emit_espia(record):
-        hilos_de_escritura.append(threading.current_thread().name)
-        emit_original(record)
+    def spy_emit(record):
+        writing_threads.append(threading.current_thread().name)
+        original_emit(record)
 
-    sesion.handler_archivo.emit = emit_espia
-    sesion.logger.info("evento desde el hilo principal")
-    sesion.stop()
+    session.file_handler.emit = spy_emit
+    session.logger.info("evento desde el hilo principal")
+    session.stop()
 
-    assert hilos_de_escritura, "el registro nunca llegó al handler de archivo"
-    assert hilos_de_escritura[0] != threading.current_thread().name
-    assert hilos_de_escritura[0] != "MainThread"
+    assert writing_threads, "el registro nunca llegó al handler de archivo"
+    assert writing_threads[0] != threading.current_thread().name
+    assert writing_threads[0] != "MainThread"
 
 
-def test_el_logger_no_tiene_habilitado_ningun_handler_de_archivo_directo(tmp_path):
-    sesion = setup_vulcano_logging(tmp_path / "directo.log")
+def test_logger_has_no_direct_file_handler(tmp_path):
+    session = setup_vulcano_logging(tmp_path / "directo.log")
 
-    assert sesion.logger.handlers, "el logger quedó sin handlers"
-    for handler in sesion.logger.handlers:
+    assert session.logger.handlers, "el logger quedó sin handlers"
+    for handler in session.logger.handlers:
         assert isinstance(handler, logging.handlers.QueueHandler), (
             f"handler de escritura directa detectado: {type(handler).__name__}"
         )
         assert not isinstance(handler, logging.FileHandler)
-    assert sesion.logger.propagate is False
+    assert session.logger.propagate is False
 
 
-def test_llamar_dos_veces_al_setup_no_duplica_lineas(tmp_path):
+def test_calling_setup_twice_does_not_duplicate_lines(tmp_path):
     log = tmp_path / "idempotente.log"
 
-    primera = setup_vulcano_logging(log)
-    segunda = setup_vulcano_logging(log)
+    first = setup_vulcano_logging(log)
+    second = setup_vulcano_logging(log)
 
-    assert segunda is not primera
-    assert primera.activa is False
-    segunda.logger.info("una sola línea")
-    segunda.stop()
+    assert second is not first
+    assert first.active is False
+    second.logger.info("una sola línea")
+    second.stop()
 
-    assert len(_leer(log)) == 1
+    assert len(_read_lines(log)) == 1
 
 
-def test_el_formatter_no_necesita_el_pipeline_para_formatear():
+def test_the_formatter_does_not_need_the_pipeline_to_format():
     """El formatter es una función pura del LogRecord: se puede usar suelto en cualquier handler."""
-    registro = logging.LogRecord(
+    record = logging.LogRecord(
         name="vulcano_engine",
         level=logging.INFO,
         pathname=__file__,
@@ -201,23 +201,23 @@ def test_el_formatter_no_necesita_el_pipeline_para_formatear():
         exc_info=None,
     )
 
-    datos = json.loads(AsyncJSONFormatter().format(registro))
+    data = json.loads(AsyncJSONFormatter().format(record))
 
-    assert datos["message"] == "suelto"
-    assert set(CAMPOS_FIJOS) <= set(datos)
+    assert data["message"] == "suelto"
+    assert set(FIXED_FIELDS) <= set(data)
 
 
-class _DestinoQueFalla:
+class _FailingTarget:
     """Destino HTTP local que responde 500: fuerza el camino de fallo del despacho."""
 
     def __init__(self) -> None:
-        destino = self
-        destino.peticiones = 0
+        target = self
+        target.requests_seen = 0
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:
                 self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                destino.peticiones += 1
+                target.requests_seen += 1
                 self.send_response(500)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -225,40 +225,40 @@ class _DestinoQueFalla:
             def log_message(self, *_args: object) -> None:
                 pass
 
-        self._servidor = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self._servidor.server_port}/webhook"
-        self._hilo = threading.Thread(target=self._servidor.serve_forever, daemon=True)
-        self._hilo.start()
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_port}/webhook"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
 
-    def cerrar(self) -> None:
-        self._servidor.shutdown()
-        self._servidor.server_close()
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
 
 @pytest.fixture
-def destino_que_falla():
-    destino = _DestinoQueFalla()
-    yield destino
-    destino.cerrar()
+def failing_target():
+    target = _FailingTarget()
+    yield target
+    target.close()
 
 
-class _SQSDeUnMensaje:
+class _SingleMessageSQS:
     """Doble mínimo del cliente SQS: entrega un mensaje y registra los borrados."""
 
-    def __init__(self, mensaje: dict) -> None:
-        self._pendiente = mensaje
-        self.borrados: list[str] = []
+    def __init__(self, message: dict) -> None:
+        self._pending = message
+        self.deleted_handles: list[str] = []
 
     def receive_message(self, **_kwargs: object) -> dict:
-        mensaje, self._pendiente = self._pendiente, None
-        return {"Messages": [mensaje]} if mensaje else {}
+        message, self._pending = self._pending, None
+        return {"Messages": [message]} if message else {}
 
     def delete_message(self, QueueUrl: str, ReceiptHandle: str) -> dict:
-        self.borrados.append(ReceiptHandle)
+        self.deleted_handles.append(ReceiptHandle)
         return {}
 
 
-def test_el_registro_de_un_despacho_real_conserva_traza_firma_y_latencia(tmp_path, destino_que_falla):
+def test_real_dispatch_record_keeps_trace_signature_and_latency(tmp_path, failing_target):
     """S12 sobre el sistema: el registro lo produce el worker de verdad, no una llamada al formatter.
 
     Se lee el archivo que quedó en disco —incluidos los respaldos comprimidos— y se comprueba que la
@@ -266,8 +266,8 @@ def test_el_registro_de_un_despacho_real_conserva_traza_firma_y_latencia(tmp_pat
     X-Webhook-Signature que se envió.
     """
     log = tmp_path / "despacho.log"
-    sesion = setup_vulcano_logging(log, max_bytes=700, backup_count=5)
-    mensaje = {
+    session = setup_vulcano_logging(log, max_bytes=700, backup_count=5)
+    message = {
         "MessageId": "msg-e2e",
         "ReceiptHandle": "rh-e2e",
         "Body": json.dumps({"transaction_id": "tx_e2e"}),
@@ -277,32 +277,32 @@ def test_el_registro_de_un_despacho_real_conserva_traza_firma_y_latencia(tmp_pat
             "WebhookId": {"StringValue": "wh-e2e"},
         },
     }
-    despachador = DespachadorSQS(
-        cliente=_SQSDeUnMensaje(mensaje),
+    dispatcher = SQSDispatcher(
+        client=_SingleMessageSQS(message),
         queue_url="http://localhost:4566/000000000000/cola-e2e",
-        target_url=destino_que_falla.url,
+        target_url=failing_target.url,
         secret="secreto_de_prueba_de_16_mas",
-        logger=sesion.logger,
+        logger=session.logger,
         timeout=5.0,
     )
 
-    assert despachador.procesar_lote() == 0, "un destino que responde 500 no puede contar como entrega"
-    for indice in range(6):
-        sesion.logger.info("relleno para forzar la rotación %s %s", indice, "y" * 60)
-    sesion.stop()
+    assert dispatcher.process_batch() == 0, "un destino que responde 500 no puede contar como entrega"
+    for index in range(6):
+        session.logger.info("relleno para forzar la rotación %s %s", index, "y" * 60)
+    session.stop()
 
-    archivos = [*sorted(tmp_path.glob("despacho.log.*.gz")), log]
-    assert any(ruta.suffix == ".gz" for ruta in archivos), "no se generó ningún .log.gz del flujo real"
+    files = [*sorted(tmp_path.glob("despacho.log.*.gz")), log]
+    assert any(path.suffix == ".gz" for path in files), "no se generó ningún .log.gz del flujo real"
 
-    registros = [json.loads(linea) for ruta in archivos for linea in _leer(ruta)]
-    del_despacho = [registro for registro in registros if registro.get("message_id") == "msg-e2e"]
+    records = [json.loads(line) for path in files for line in _read_lines(path)]
+    of_dispatch = [record for record in records if record.get("message_id") == "msg-e2e"]
 
-    assert len(del_despacho) == 1, f"el despacho real no dejó exactamente un registro: {del_despacho}"
-    registro = del_despacho[0]
-    assert registro["trace_id"] == "trace-e2e", "el TraceId de SQS no llegó al registro"
-    assert registro["webhook_id"] == "wh-e2e", "el WebhookId del atributo no llegó al registro"
-    assert registro["retry_count"] == 2, "el contador de reintentos no llegó al registro"
-    assert isinstance(registro["latency_ms"], (int, float)), "la latencia de la entrega no quedó registrada"
-    notas = " ".join(registro.get("notes", []))
-    assert "X-Webhook-Signature=" in notas, f"el registro no conserva la firma enviada: {registro}"
-    assert registro["exception"]["type"] == "WebhookDeliveryError"
+    assert len(of_dispatch) == 1, f"el despacho real no dejó exactamente un registro: {of_dispatch}"
+    record = of_dispatch[0]
+    assert record["trace_id"] == "trace-e2e", "el TraceId de SQS no llegó al registro"
+    assert record["webhook_id"] == "wh-e2e", "el WebhookId del atributo no llegó al registro"
+    assert record["retry_count"] == 2, "el contador de reintentos no llegó al registro"
+    assert isinstance(record["latency_ms"], (int, float)), "la latencia de la entrega no quedó registrada"
+    notes = " ".join(record.get("notes", []))
+    assert "X-Webhook-Signature=" in notes, f"el registro no conserva la firma enviada: {record}"
+    assert record["exception"]["type"] == "WebhookDeliveryError"

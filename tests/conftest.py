@@ -12,9 +12,9 @@ import pytest
 def pytest_collection_modifyitems(config, items):
     if os.getenv("VULCANO_IT") == "1":
         return
-    salto = pytest.mark.skip(
+    skip_marker = pytest.mark.skip(
         reason="integración: requiere LocalStack en http://localhost:4566 (activar con VULCANO_IT=1)"
     )
     for item in items:
         if "integration" in item.keywords:
-            item.add_marker(salto)
+            item.add_marker(skip_marker)
