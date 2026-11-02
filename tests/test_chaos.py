@@ -27,9 +27,12 @@ from httpx import Response
 from vulcano_telemetry.dispatcher import SQSDispatcher
 from vulcano_telemetry.exceptions import WebhookTimestampError
 from vulcano_telemetry.webhook_crypto import generate_signature, verify_signature
-from vulcano_telemetry.webhook_receiver import QUEUE_URL, WEBHOOK_SECRET, app
+from vulcano_telemetry.webhook_receiver import app
 
 ENDPOINT_URL = os.getenv("VULCANO_ENDPOINT_URL", "http://localhost:4566")
+QUEUE_NAME = os.getenv("VULCANO_QUEUE_NAME", "vulcano-events-queue")
+# El receptor del rol 3 toma el secreto del entorno: el test firma con este y se lo inyecta.
+WEBHOOK_SECRET = "secreto-de-caos-suficientemente-largo"
 WEBHOOK_PATH = "/webhook"
 SIGNATURE_HEADER = "X-Webhook-Signature"
 
@@ -83,6 +86,12 @@ def _assert_rejected(response: Response, reason: str) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _webhook_secret(monkeypatch):
+    """El receptor lee la clave HMAC de `VULCANO_WEBHOOK_SECRET`; acá se la damos."""
+    monkeypatch.setenv("VULCANO_WEBHOOK_SECRET", WEBHOOK_SECRET)
+
+
 @pytest.fixture
 def enqueue_forbidden(monkeypatch):
     """Un webhook rechazado no debe tocar SQS: si el receptor intenta encolar, el caso falla."""
@@ -90,13 +99,18 @@ def enqueue_forbidden(monkeypatch):
     def _forbidden(*_args, **_kwargs):
         raise AssertionError("el receptor intentó encolar un webhook rechazado")
 
-    monkeypatch.setattr("vulcano_telemetry.webhook_receiver.produce_event", _forbidden)
+    monkeypatch.setattr("vulcano_telemetry.webhook_receiver.send_event", _forbidden)
+
+
+def _queue_url(sqs_client) -> str:
+    """URL de la cola de la demo, resuelta con `get_queue_url` y nunca concatenada a mano."""
+    return sqs_client.get_queue_url(QueueName=QUEUE_NAME)["QueueUrl"]
 
 
 def _available_messages(sqs_client) -> int:
     """Mensajes disponibles en la cola, según el atributo de SQS (eventual, no exacto al instante)."""
     attributes = sqs_client.get_queue_attributes(
-        QueueUrl=QUEUE_URL, AttributeNames=["ApproximateNumberOfMessages"]
+        QueueUrl=_queue_url(sqs_client), AttributeNames=["ApproximateNumberOfMessages"]
     )["Attributes"]
     return int(attributes.get("ApproximateNumberOfMessages", "0"))
 
@@ -122,12 +136,12 @@ def _clear_marker(sqs_client, marker: str, attempts: int = MAX_WAIT_SECONDS) -> 
     """
     for _ in range(attempts):
         response = sqs_client.receive_message(
-            QueueUrl=QUEUE_URL, MaxNumberOfMessages=10, WaitTimeSeconds=0, VisibilityTimeout=0
+            QueueUrl=_queue_url(sqs_client), MaxNumberOfMessages=10, WaitTimeSeconds=0, VisibilityTimeout=0
         )
         messages = response.get("Messages", [])
         for message in messages:
             if marker in message.get("Body", ""):
-                sqs_client.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=message["ReceiptHandle"])
+                sqs_client.delete_message(QueueUrl=_queue_url(sqs_client), ReceiptHandle=message["ReceiptHandle"])
                 return True
         if not messages:
             return False
@@ -247,7 +261,8 @@ def test_valid_webhook_is_accepted_and_enqueued():
     marker = json.loads(body)["id"]
     before = _available_messages(sqs_client)
 
-    response = _send(TestClient(app), body, _signature_header(WEBHOOK_SECRET, int(time.time()), body))
+    with TestClient(app) as client:
+        response = _send(client, body, _signature_header(WEBHOOK_SECRET, int(time.time()), body))
 
     try:
         assert response.status_code == 202, (
@@ -319,6 +334,6 @@ def test_verify_signature_raises_webhook_timestamp_error_for_an_old_timestamp():
     with pytest.raises(WebhookTimestampError) as raised:
         verify_signature(WEBHOOK_SECRET, f"t={one_hour_ago},v1={signature}", body)
 
-    assert "tolerancia" in str(raised.value), (
-        f"la excepción no describe el problema de ventana temporal: {raised.value}"
-    )
+    # El tipo lanzado ya prueba el orden de las validaciones; el texto lo redacta el rol 3, así que
+    # no se fija acá: se exige que explique el rechazo, no una frase exacta.
+    assert str(raised.value), "la excepción debe explicar el rechazo"

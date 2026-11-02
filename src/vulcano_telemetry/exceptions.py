@@ -1,25 +1,51 @@
-"""Excepciones semánticas personalizadas para el proyecto Vulcano Pay (SQS + Webhooks)."""
+"""
+Proyecto Vulcano Pay
+Módulo: exceptions.py
+Responsabilidad: Integrante 1
+
+Define las excepciones semánticas utilizadas
+por el sistema de mensajería SQS y Webhooks.
+"""
+
 
 class VulcanoError(Exception):
-    """Excepción base para todos los errores del ecosistema Vulcano."""
+    """Excepción base del sistema Vulcano Pay."""
     pass
+
+
+# ==========================================
+# EXCEPCIONES DEL DOMINIO SQS
+# ==========================================
 
 class SQSConnectionError(VulcanoError):
-    """Lanzada ante fallos de comunicación con AWS SQS / LocalStack."""
+    """Error de conexión con AWS SQS o LocalStack."""
     pass
+
+
+class QueueTimeoutError(VulcanoError):
+    """Tiempo de espera de una operación SQS agotado."""
+    pass
+
 
 class CorruptedMessageError(VulcanoError):
-    """Lanzada cuando el cuerpo del mensaje SQS no es un JSON válido."""
+    """Mensaje SQS con contenido inválido o corrupto."""
     pass
+
+
+# ==========================================
+# EXCEPCIONES DEL DOMINIO WEBHOOK
+# ==========================================
 
 class WebhookSignatureError(VulcanoError):
-    """Lanzada cuando la firma criptográfica HMAC-SHA256 es inválida o ausente."""
+    """Firma criptográfica HMAC inválida o ausente."""
     pass
+
 
 class WebhookTimestampError(VulcanoError):
-    """Lanzada cuando el timestamp del Webhook está fuera de la ventana de tolerancia (Replay Attack)."""
+    """Timestamp fuera de la ventana de tolerancia."""
     pass
 
+
 class WebhookDeliveryError(VulcanoError):
-    """Lanzada cuando el envío HTTP del Webhook falla tras reintentos."""
+    """Error al entregar un Webhook HTTP al destino."""
     pass
