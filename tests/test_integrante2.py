@@ -17,16 +17,14 @@ sys.path.insert(
 )
 
 from vulcano_telemetry.core_sqs import (
-    send_event,
-    receive_events,
     delete_message,
+    receive_events,
+    send_event,
 )
-
 from vulcano_telemetry.exceptions import (
     CorruptedMessageError,
     SQSConnectionError,
 )
-
 
 QUEUE_URL = "http://localhost:4566/000000000000/vulcano-events-queue"
 

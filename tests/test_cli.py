@@ -165,7 +165,9 @@ def test_invalid_queue_name_exits_with_code_2(capsys, pipeline):
 
     error = capsys.readouterr().err
 
-    assert "Nombre de cola inválido 'cola-invalida'" in error, f"falta el mensaje del sanitizador: {error!r}"
+    assert "-q/--queue" in error and "cola-invalida" in error, (
+        f"el error debe salir del sanitizador de -q/--queue y nombrar el valor rechazado: {error!r}"
+    )
     assert pipeline.shutdowns == [], "una validación de argparse no debe ni arrancar el pipeline"
 
 

@@ -12,8 +12,8 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from botocore.exceptions import BotoCoreError, ClientError
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException, Request, status
 from starlette.concurrency import run_in_threadpool
 
@@ -28,13 +28,12 @@ from .webhook_crypto import verify_signature
 logger = logging.getLogger("vulcano_engine")
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Inicializa SQS y obtiene la URL de la cola una vez."""
 
     sqs_client = get_sqs_client(
-        os.getenv("LOCALSTACK_ENDPOINT", "http://localhost:4566")
+        os.getenv("VULCANO_ENDPOINT_URL", "http://localhost:4566")
     )
 
     try:
@@ -43,10 +42,20 @@ async def lifespan(app: FastAPI):
             "vulcano-events-queue",
         )
 
-        queue_response = await run_in_threadpool(
-            sqs_client.get_queue_url,
-            QueueName=queue_name,
-        )
+        try:
+            queue_response = await run_in_threadpool(
+                sqs_client.get_queue_url,
+                QueueName=queue_name,
+            )
+
+        except (ClientError, BotoCoreError) as error:
+            # Sin traducción, la CLI no puede mapear esto al código de salida 4.
+            sqs_error = SQSConnectionError(
+                f"No se pudo resolver la cola '{queue_name}' en SQS."
+            )
+            sqs_error.add_note("Operacion: get_queue_url")
+            sqs_error.add_note(f"QueueName: {queue_name}")
+            raise sqs_error from error
 
         app.state.sqs_client = sqs_client
         app.state.queue_url = queue_response["QueueUrl"]
@@ -100,14 +109,25 @@ async def receive_webhook(request: Request):
             payload_bytes=raw_body,
         )
 
-    except (WebhookSignatureError, WebhookTimestampError) as error:
+    except WebhookSignatureError as error:
         logger.warning(
-            "Webhook rechazado: %s",
+            "Webhook rechazado por firma: %s",
             type(error).__name__,
         )
         raise HTTPException(
-            status_code=401,
-            detail="Firma o timestamp invalido.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Firma HMAC invalida o ausente.",
+        ) from error
+
+    except WebhookTimestampError as error:
+        # 403 y no 401: el replay no es un problema de autenticidad sino de ventana temporal.
+        logger.warning(
+            "Webhook rechazado por timestamp: %s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Timestamp fuera de la ventana permitida.",
         ) from error
 
     try:
@@ -115,15 +135,15 @@ async def receive_webhook(request: Request):
 
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="JSON invalido.",
         ) from error
 
     if not isinstance(payload, dict):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="El evento debe ser un objeto JSON.",
-        )
+        ) from None
 
     try:
         sqs_client = request.app.state.sqs_client
@@ -137,6 +157,7 @@ async def receive_webhook(request: Request):
             event_topic=payload.get(
                 "event_type", "payment.event"
             ),
+            webhook_id=payload.get("webhook_id"),
         )
 
     except (SQSConnectionError, BotoCoreError, ClientError) as error:

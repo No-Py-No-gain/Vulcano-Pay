@@ -21,22 +21,20 @@ sys.path.insert(
 )
 
 from vulcano_telemetry.exceptions import (
-    VulcanoError,
-    SQSConnectionError,
-    QueueTimeoutError,
     CorruptedMessageError,
+    QueueTimeoutError,
+    SQSConnectionError,
+    VulcanoError,
+    WebhookDeliveryError,
     WebhookSignatureError,
     WebhookTimestampError,
-    WebhookDeliveryError,
 )
-
 from vulcano_telemetry.sanitizer import (
     parse_queue_name,
+    parse_secret_key,
     parse_wait_time,
     parse_webhook_url,
-    parse_secret_key,
 )
-
 
 # ==========================================
 # PRUEBAS DE EXCEPCIONES

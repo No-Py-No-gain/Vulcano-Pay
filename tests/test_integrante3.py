@@ -9,18 +9,22 @@ Validacion de firmas HMAC-SHA256 y timestamps.
 import hashlib
 import hmac
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError, EndpointConnectionError
+from fastapi.testclient import TestClient
 
-from src.vulcano_telemetry.webhook_crypto import (
-    generate_signature,
-    verify_signature,
-)
-from src.vulcano_telemetry.exceptions import (
+from vulcano_telemetry.exceptions import (
+    SQSConnectionError,
     WebhookSignatureError,
     WebhookTimestampError,
 )
-
+from vulcano_telemetry.webhook_crypto import (
+    generate_signature,
+    verify_signature,
+)
+from vulcano_telemetry.webhook_receiver import app
 
 SECRET = "clave_super_segura_vulcano_2026"
 PAYLOAD = b'{"payment_id":"PAY-001","amount":350}'
@@ -144,12 +148,6 @@ def test_verify_signature_malformed_header(header):
             PAYLOAD,
         )
 
-from unittest.mock import MagicMock, patch
-
-from fastapi.testclient import TestClient
-
-from src.vulcano_telemetry.webhook_receiver import app
-
 
 @pytest.fixture
 def http_client(monkeypatch):
@@ -169,10 +167,10 @@ def http_client(monkeypatch):
     }
 
     with patch(
-        "src.vulcano_telemetry.webhook_receiver.get_sqs_client",
+        "vulcano_telemetry.webhook_receiver.get_sqs_client",
         return_value=sqs_mock,
     ), patch(
-        "src.vulcano_telemetry.webhook_receiver.send_event",
+        "vulcano_telemetry.webhook_receiver.send_event",
         return_value="test-message-id",
     ):
         with TestClient(app) as client:
@@ -213,7 +211,7 @@ def test_webhook_http_invalid_signature(http_client):
 
 
 def test_webhook_http_expired_timestamp(http_client):
-    """Un timestamp vencido recibe HTTP 401."""
+    """Un timestamp vencido recibe HTTP 403."""
     timestamp = int(time.time()) - 3600
     header = make_header(SECRET, timestamp, PAYLOAD)
 
@@ -223,11 +221,11 @@ def test_webhook_http_expired_timestamp(http_client):
         headers={"X-Webhook-Signature": header},
     )
 
-    assert response.status_code == 401
+    assert response.status_code == 403
 
 
 def test_webhook_http_invalid_json(http_client):
-    """Un JSON incorrecto recibe HTTP 400."""
+    """Un JSON incorrecto recibe HTTP 422."""
     payload = b"{json_invalido"
     timestamp = int(time.time())
     header = make_header(SECRET, timestamp, payload)
@@ -238,7 +236,7 @@ def test_webhook_http_invalid_json(http_client):
         headers={"X-Webhook-Signature": header},
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 422
 
 
 def test_webhook_http_missing_signature(http_client):
@@ -250,15 +248,14 @@ def test_webhook_http_missing_signature(http_client):
 
     assert response.status_code == 401
 
+
 def test_webhook_http_sqs_unavailable(http_client):
     """Si SQS falla, el webhook debe responder HTTP 503."""
-    from botocore.exceptions import EndpointConnectionError
-
     timestamp = int(time.time())
     header = make_header(SECRET, timestamp, PAYLOAD)
 
     with patch(
-        "src.vulcano_telemetry.webhook_receiver.send_event",
+        "vulcano_telemetry.webhook_receiver.send_event",
         side_effect=EndpointConnectionError(
             endpoint_url="http://localhost:4566"
         ),
@@ -273,3 +270,29 @@ def test_webhook_http_sqs_unavailable(http_client):
     assert response.json()["detail"] == (
         "Servicio de mensajeria no disponible."
     )
+
+
+def test_lifespan_translates_missing_queue_into_sqs_connection_error():
+    """Un `get_queue_url` fallido en el arranque sale como SQSConnectionError.
+
+    La traduccion es la que permite a la CLI mapear la falta de cola al codigo de salida 4:
+    si el `lifespan` dejara escapar el `ClientError` de boto3, ningun `except` del dominio
+    lo atraparia.
+    """
+    sqs_mock = MagicMock()
+    sqs_mock.get_queue_url.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "AWS.SimpleQueueService.NonExistentQueue",
+                "Message": "no existe",
+            }
+        },
+        "GetQueueUrl",
+    )
+
+    with patch(
+        "vulcano_telemetry.webhook_receiver.get_sqs_client",
+        return_value=sqs_mock,
+    ), pytest.raises(SQSConnectionError):
+        with TestClient(app):
+            pass
