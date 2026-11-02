@@ -5,13 +5,22 @@ criptográfica HMAC-SHA256 sobre los bytes crudos, desacople mediante AWS SQS (e
 LocalStack) vía Boto3, despacho firmado hacia destinos de terceros y observabilidad con logs JSON
 no bloqueantes y rotación comprimida.
 
-Trabajo Práctico N.º 2 — Programación para Automatización II (UPATecO).
+## Trabajo Práctico N.º 2 — Programación para Automatización II (UPATecO).
+
+## Integrantes del grupo
+
+- **Gaita, Juan Pablo**
+- **Gonza, Rodrigo Eduardo**
+
+## Defensa del Proyecto
+
+[Ver Video de la defensa del proyecto](https://drive.google.com/drive/folders/1dTO0F_5OOyZ8RcHXCUMeorA-dsuzPDrT?usp=sharing)
 
 ## Reparto de roles
 
 El trabajo se dividió en seis roles. Cada módulo tiene un dueño, cada módulo tiene sus pruebas y
 cada criterio de evaluación de la cátedra queda cubierto por un rol identificable. Las secciones de
-[«Módulos de dominio»](#módulos-de-dominio) describen ese trabajo uno por uno.
+[«Módulos»](#módulos-de-dominio) describen ese trabajo uno por uno.
 
 | Rol | Responsabilidad | Módulos | Pruebas |
 |---|---|---|---|
@@ -43,7 +52,7 @@ roles 1-3 y los roles 4-6 —más las correcciones de contrato del receptor y de
 de la CLI— está pinneada en `tests/test_contract_regressions.py`, para que ninguna de esas
 correcciones se pierda en un refactor posterior.
 
-## Condiciones de entrega (§2.1)
+## Condiciones de entrega
 
 | Condición del enunciado | Cómo se cumple |
 |---|---|
