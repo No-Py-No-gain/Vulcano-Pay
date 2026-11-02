@@ -53,6 +53,7 @@ def send_event(
     event_data: dict,
     trace_id: str | None = None,
     event_topic: str = "payment.event",
+    webhook_id: str | None = None,
 ) -> str:
     """Publica un evento JSON con atributos de trazabilidad."""
 
@@ -64,24 +65,32 @@ def send_event(
 
     payload = json.dumps(event_data, ensure_ascii=False)
 
+    message_attributes = {
+        "TraceId": {
+            "DataType": "String",
+            "StringValue": trace_id,
+        },
+        "EventTopic": {
+            "DataType": "String",
+            "StringValue": event_topic,
+        },
+        "Timestamp": {
+            "DataType": "String",
+            "StringValue": timestamp,
+        },
+    }
+
+    if webhook_id:
+        message_attributes["WebhookId"] = {
+            "DataType": "String",
+            "StringValue": webhook_id,
+        }
+
     try:
         response = sqs_client.send_message(
             QueueUrl=queue_url,
             MessageBody=payload,
-            MessageAttributes={
-                "TraceId": {
-                    "DataType": "String",
-                    "StringValue": trace_id,
-                },
-                "EventTopic": {
-                    "DataType": "String",
-                    "StringValue": event_topic,
-                },
-                "Timestamp": {
-                    "DataType": "String",
-                    "StringValue": timestamp,
-                },
-            },
+            MessageAttributes=message_attributes,
         )
 
         message_id = response["MessageId"]
@@ -92,6 +101,7 @@ def send_event(
                 "message_id": message_id,
                 "trace_id": trace_id,
                 "event_topic": event_topic,
+                "webhook_id": webhook_id,
             },
         )
 
@@ -289,35 +299,26 @@ def receive_events_safe(
     }
 
 # ============================================================
-# AGREGADO F 31-10 COMPATIBILIDAD CON LOS MODULOS EXISTENTES DEL EQUIPO
+# Compatibilidad con las interfaces que ya consumía el equipo
 # ============================================================
 
 def produce_event(sqs_client, queue_url: str, event_data: dict) -> str:
-    """
-    Publica un evento en SQS conservando la interfaz original
-    utilizada por webhook_receiver.py.
+    """Publica un evento conservando la interfaz original y delega en `send_event`.
+
+    La CLI (`produce-sqs`) y el receptor publican por acá, así que los atributos de trazabilidad
+    (C2 del contrato de interfaces) se inyectan en un solo lugar: `TraceId`, `EventTopic`,
+    `Timestamp` y, cuando el evento lo trae, `WebhookId`.
     """
     if not isinstance(event_data, dict):
         raise ValueError("event_data debe ser un diccionario.")
 
-    try:
-        response = sqs_client.send_message(
-            QueueUrl=queue_url,
-            MessageBody=json.dumps(event_data),
-            MessageAttributes={
-                "Source": {
-                    "DataType": "String",
-                    "StringValue": "VulcanoWebhookEngine",
-                }
-            },
-        )
-
-        msg_id = response.get("MessageId", "N/A")
-        logger.info("Evento publicado en SQS. MessageId: %s", msg_id)
-        return msg_id
-
-    except (ClientError, BotoCoreError) as error:
-        _raise_sqs_error("send_message", queue_url, error)
+    return send_event(
+        sqs_client,
+        queue_url,
+        event_data,
+        event_topic=event_data.get("event_topic", "payment.event"),
+        webhook_id=event_data.get("webhook_id"),
+    )
 
 
 def consume_events(
@@ -325,25 +326,41 @@ def consume_events(
     queue_url: str,
     wait_time: int = 10,
     max_messages: int = 5,
-):
-    """
-    Recibe mensajes manteniendo la estructura original esperada
-    por app_operator.py.
+) -> list[dict]:
+    """Contrato estable de consumo (C3 y C4 del contrato de interfaces).
 
-    No elimina mensajes automaticamente.
+    Nunca aborta el lote: cada mensaje vuelve con `approx_receive_count` y con la marca `corrupt`.
+    Un cuerpo inservible viaja con `body=None`, `corrupt=True` y la excepción en `error`, y **no** se
+    borra: el `VisibilityTimeout` lo devuelve a la cola y el `RedrivePolicy` lo deriva a la DLQ.
     """
-    eventos = receive_events(
+    batch = receive_events_safe(
         sqs_client,
         queue_url,
         wait_time=wait_time,
         max_messages=max_messages,
     )
 
-    return [
+    events = [
         {
-            "receipt_handle": evento["receipt_handle"],
-            "message_id": evento["message_id"],
-            "body": evento["body"],
+            "message_id": event["message_id"],
+            "receipt_handle": event["receipt_handle"],
+            "body": event["body"],
+            "approx_receive_count": int(event.get("receive_count") or 1),
+            "corrupt": False,
         }
-        for evento in eventos
+        for event in batch["valid"]
     ]
+
+    events.extend(
+        {
+            "message_id": event["message_id"],
+            "receipt_handle": event.get("receipt_handle"),
+            "body": None,
+            "approx_receive_count": int(event.get("receive_count") or 1),
+            "corrupt": True,
+            "error": event["error"],
+        }
+        for event in batch["corrupted"]
+    )
+
+    return events

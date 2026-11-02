@@ -154,8 +154,10 @@ async def receive_webhook(request: Request):
             sqs_client,
             queue_url,
             payload,
+            # Misma fuente que `produce_event`: el topic viaja como `event_topic`; `event_type`
+            # queda como alias para eventos de pasarelas que usan ese nombre.
             event_topic=payload.get(
-                "event_type", "payment.event"
+                "event_topic", payload.get("event_type", "payment.event")
             ),
             webhook_id=payload.get("webhook_id"),
         )

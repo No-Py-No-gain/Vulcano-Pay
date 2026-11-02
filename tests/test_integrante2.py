@@ -4,6 +4,7 @@ Proyecto Vulcano Pay
 Pruebas automatizadas - Integrante 2.
 """
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -17,7 +18,9 @@ sys.path.insert(
 )
 
 from vulcano_telemetry.core_sqs import (
+    consume_events,
     delete_message,
+    produce_event,
     receive_events,
     send_event,
 )
@@ -359,4 +362,167 @@ def test_receive_events_safe_json_list():
     ]
 
     assert len(result["corrupted"]) == 0
+    client.delete_message.assert_not_called()
+
+
+def test_produce_event_publishes_trace_attributes():
+    """
+    Verifica que produce_event publique TraceId, EventTopic y Timestamp,
+    devuelva el MessageId y serialice el evento como JSON.
+    """
+    client = MagicMock()
+    client.send_message.return_value = {
+        "MessageId": "msg-produce-001"
+    }
+
+    event_data = {"payment_id": "PAY-001"}
+
+    result = produce_event(
+        sqs_client=client,
+        queue_url=QUEUE_URL,
+        event_data=event_data,
+    )
+
+    assert result == "msg-produce-001"
+
+    arguments = client.send_message.call_args.kwargs
+    attributes = arguments["MessageAttributes"]
+
+    assert attributes["TraceId"]["StringValue"]
+    assert attributes["EventTopic"]["StringValue"] == "payment.event"
+    assert attributes["Timestamp"]["StringValue"]
+    assert "WebhookId" not in attributes
+
+    assert json.loads(arguments["MessageBody"]) == event_data
+
+
+def test_produce_event_adds_webhook_id_attribute():
+    """
+    Verifica que produce_event agregue WebhookId y respete
+    el event_topic que viene dentro del evento.
+    """
+    client = MagicMock()
+    client.send_message.return_value = {
+        "MessageId": "msg-produce-002"
+    }
+
+    event_data = {
+        "payment_id": "PAY-002",
+        "event_topic": "payment.refunded",
+        "webhook_id": "WH-001",
+    }
+
+    produce_event(
+        sqs_client=client,
+        queue_url=QUEUE_URL,
+        event_data=event_data,
+    )
+
+    attributes = client.send_message.call_args.kwargs[
+        "MessageAttributes"
+    ]
+
+    assert attributes["EventTopic"]["StringValue"] == "payment.refunded"
+    assert attributes["WebhookId"]["StringValue"] == "WH-001"
+
+
+def test_consume_events_parses_approx_receive_count():
+    """
+    Verifica que consume_events devuelva los mensajes validos con
+    approx_receive_count como entero y corrupt en False.
+    """
+    client = MagicMock()
+
+    client.receive_message.return_value = {
+        "Messages": [
+            {
+                "MessageId": "msg-consume-001",
+                "ReceiptHandle": "receipt-consume-001",
+                "Body": '{"payment_id": "PAY-001"}',
+                "Attributes": {
+                    "ApproximateReceiveCount": "3"
+                },
+            },
+            {
+                "MessageId": "msg-consume-002",
+                "ReceiptHandle": "receipt-consume-002",
+                "Body": '{"payment_id": "PAY-002"}',
+            },
+        ]
+    }
+
+    events = consume_events(
+        sqs_client=client,
+        queue_url=QUEUE_URL,
+        wait_time=5,
+        max_messages=2,
+    )
+
+    assert len(events) == 2
+
+    assert events[0]["message_id"] == "msg-consume-001"
+    assert events[0]["receipt_handle"] == "receipt-consume-001"
+    assert events[0]["body"] == {"payment_id": "PAY-001"}
+    assert events[0]["approx_receive_count"] == 3
+    assert isinstance(events[0]["approx_receive_count"], int)
+    assert events[0]["corrupt"] is False
+
+    # SQS no informo el contador: el contrato fija el minimo en 1.
+    assert events[1]["approx_receive_count"] == 1
+    assert events[1]["corrupt"] is False
+
+    client.delete_message.assert_not_called()
+
+
+def test_consume_events_keeps_corrupt_message_in_batch():
+    """
+    Verifica que consume_events no aborte el lote cuando un cuerpo
+    es corrupto: devuelve el valido y el corrupto marcado, sin borrar.
+    """
+    client = MagicMock()
+
+    client.receive_message.return_value = {
+        "Messages": [
+            {
+                "MessageId": "msg-consume-valid",
+                "ReceiptHandle": "receipt-consume-valid",
+                "Body": '{"payment_id": "PAY-001"}',
+                "Attributes": {
+                    "ApproximateReceiveCount": "2"
+                },
+            },
+            {
+                "MessageId": "msg-consume-corrupt",
+                "ReceiptHandle": "receipt-consume-corrupt",
+                "Body": "{json_invalido",
+                "Attributes": {
+                    "ApproximateReceiveCount": "1"
+                },
+            },
+        ]
+    }
+
+    events = consume_events(
+        sqs_client=client,
+        queue_url=QUEUE_URL,
+        wait_time=5,
+        max_messages=2,
+    )
+
+    assert len(events) == 2
+
+    valid, corrupt = events
+
+    assert valid["message_id"] == "msg-consume-valid"
+    assert valid["body"] == {"payment_id": "PAY-001"}
+    assert valid["corrupt"] is False
+
+    assert corrupt["message_id"] == "msg-consume-corrupt"
+    assert corrupt["corrupt"] is True
+    assert corrupt["body"] is None
+    assert corrupt["approx_receive_count"] == 1
+    assert isinstance(corrupt["error"], CorruptedMessageError)
+    assert corrupt["error"].__cause__ is not None
+
+    # Ningun mensaje del lote se elimina automaticamente.
     client.delete_message.assert_not_called()
