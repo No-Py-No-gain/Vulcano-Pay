@@ -110,3 +110,23 @@ def verify_signature(
         )
 
     return True
+
+
+def build_signature_header(
+    secret: str,
+    payload_bytes: bytes,
+    timestamp: int | None = None,
+) -> tuple[int, str]:
+    """Devuelve (timestamp, 't=<timestamp>,v1=<hmac>') usando generate_signature.
+
+    Único dueño del formato de la cabecera: el emisor compone con esta función y el receptor
+    interpreta con `verify_signature`, así el round-trip queda garantizado por construcción y no
+    por convención.
+    """
+
+    if timestamp is None:
+        timestamp = int(time.time())
+
+    header = f"t={timestamp},v1={generate_signature(secret, timestamp, payload_bytes)}"
+
+    return timestamp, header

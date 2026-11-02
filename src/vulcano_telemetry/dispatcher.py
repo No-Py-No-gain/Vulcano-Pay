@@ -29,7 +29,7 @@ from botocore.exceptions import ClientError
 
 from .exceptions import CorruptedMessageError, SQSConnectionError, WebhookDeliveryError
 from .logging_engine import LOGGER_NAME
-from .webhook_crypto import generate_signature
+from .webhook_crypto import build_signature_header as build_crypto_signature_header
 
 SIGNATURE_HEADER = "X-Webhook-Signature"
 DEFAULT_TIMEOUT = 5.0
@@ -53,13 +53,12 @@ def serialize_body(payload: dict[str, Any]) -> bytes:
 
 
 def build_signature_header(secret: str, timestamp: int, body: bytes) -> str:
-    """Compone la cabecera `t=<timestamp>,v1=<hmac>`.
+    """Compone la cabecera `t=<timestamp>,v1=<hmac>` delegando en el rol 3 (C6 del contrato).
 
-    El formato se toma del rol 3 vía `generate_signature`, que ya existe en el repo. Cuando su
-    `build_signature_header` llegue (contrato W0) esta función delega y queda un único dueño del
-    formato en todo el sistema.
+    Este módulo sólo adapta el orden de parámetros: el formato vive en `webhook_crypto` para que
+    emisor y receptor no puedan divergir.
     """
-    return f"t={timestamp},v1={generate_signature(secret, timestamp, body)}"
+    return build_crypto_signature_header(secret, body, timestamp=timestamp)[1]
 
 
 def dispatch_webhook(

@@ -4,12 +4,13 @@ API pública del paquete. Sólo se re-exporta lo que no arrastra dependencias ex
 importar: el resto de los módulos (SQS, crypto, receiver, logging) se importan explícitamente
 para no romper el arranque cuando boto3 o fastapi no están instalados.
 
-Pendiente del rol 1 (ver contrato de interfaces): `QueueTimeoutError` se suma a este `__all__`
-cuando el módulo `exceptions.py` lo defina.
+`QueueTimeoutError` (rol 1, pedido C1 del contrato) ya existe y se re-exporta: es la única forma
+semántica de distinguir "la cola está vacía" de "SQS falló".
 """
 
 from .exceptions import (
     CorruptedMessageError,
+    QueueTimeoutError,
     SQSConnectionError,
     VulcanoError,
     WebhookDeliveryError,
@@ -19,6 +20,7 @@ from .exceptions import (
 
 __all__ = [
     "CorruptedMessageError",
+    "QueueTimeoutError",
     "SQSConnectionError",
     "VulcanoError",
     "WebhookDeliveryError",
