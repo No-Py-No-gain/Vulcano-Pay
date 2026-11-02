@@ -1,288 +1,290 @@
-Vulcano Pay =)
+# Vulcano Telemetry — Proyecto Vulcano Pay
 
-**Motor de eventos con Amazon SQS, LocalStack y webhooks seguros mediante HMAC-SHA256.**
+Motor de eventos asíncronos para Vulcano Pay: recepción de webhooks HTTP con validación
+criptográfica HMAC-SHA256 sobre los bytes crudos, desacople mediante AWS SQS (emulado con
+LocalStack) vía Boto3, despacho firmado hacia destinos de terceros y observabilidad con logs JSON
+no bloqueantes y rotación comprimida.
 
-1. Descripción del proyecto
+Trabajo Práctico N.º 2 — Programación para Automatización II (UPATecO).
 
-Vulcano Pay es un proyecto desarrollado en Python que implementa un sistema de recepción, validación y publicación de eventos asociados a transacciones.
+## Arquitectura
 
-Utiliza FastAPI para recibir solicitudes HTTP, HMAC-SHA256 para verificar la autenticidad e integridad de los mensajes y Amazon SQS, emulado mediante LocalStack, para almacenar los eventos.
-
-El proyecto incorpora validación de parámetros, excepciones personalizadas, trazabilidad de mensajes y pruebas automatizadas.
-
-2. Arquitectura
-
-Flujo de publicación implementado:
-
-```text
-CLI (app_operator.py)
-        |
-        | HTTP POST /webhook
-        | X-Webhook-Signature
-        v
-FastAPI (webhook_receiver.py)
-        |
-        | Verificación HMAC y timestamp
-        | Validación JSON
-        v
-Motor SQS (core_sqs.py)
-        |
-        | Publicación con atributos
-        v
-LocalStack / Amazon SQS
-        |
-        +-- vulcano-events-queue
-                  |
-                  | Redrive Policy
-                  v
-            vulcano-events-dlq
+```mermaid
+flowchart LR
+    C["Cliente / pasarela"] -->|"POST /webhook<br/>X-Webhook-Signature"| R["webhook_receiver<br/>FastAPI :8000"]
+    R -->|"HMAC sobre bytes crudos<br/>+ ventana de timestamp"| R
+    R -->|"válido: send_event"| Q[("vulcano-events-queue")]
+    R -->|"rechazo 401 / 403 / 422"| C
+    Q -->|"long polling"| W["SQSDispatcher"]
+    W -->|"dispatch_webhook<br/>firma + POST"| D["Destino del cliente"]
+    D -->|"2xx"| W
+    W -->|"delete_message"| Q
+    W -->|"fallo: no borra"| Q
+    Q -->|"maxReceiveCount = 3"| DLQ[("vulcano-events-dlq")]
+    R -.->|"QueueHandler"| L[["QueueListener<br/>JSON + gzip"]]
+    W -.->|"QueueHandler"| L
 ```
 
-El receptor devuelve HTTP `202 Accepted` cuando el evento se publica correctamente en SQS.
+## Flujo de un evento
 
-3. Estructura del proyecto
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant R as Receptor :8000
+    participant S as SQS (LocalStack)
+    participant W as Worker
+    participant D as Destino
 
-```text
-Vulcano-Pay/
-├── README.md
-├── requirements.txt
+    C->>R: POST /webhook (cuerpo crudo + t=…,v1=…)
+    R->>R: HMAC-SHA256 sobre los bytes crudos
+    alt firma inválida
+        R-->>C: 401
+    else timestamp fuera de la ventana anti-replay
+        R-->>C: 403
+    else JSON inservible
+        R-->>C: 422
+    else válido
+        R->>S: send_message(evento + atributos de trazabilidad)
+        R-->>C: 202 Accepted
+        W->>S: receive_message (long polling)
+        S-->>W: mensaje + ApproximateReceiveCount
+        W->>D: POST firmado
+        alt 2xx
+            W->>S: delete_message
+        else fallo de entrega
+            Note over W,S: no se borra<br/>VisibilityTimeout → reintento → DLQ
+        end
+    end
+```
+
+## Estructura
+
+```
+vulcano_engine/
 ├── src/
-│   ├── app_operator.py
-│   └── vulcano_telemetry/
-│       ├── __init__.py
-│       ├── core_sqs.py
-│       ├── exceptions.py
-│       ├── logging_engine.py
-│       ├── sanitizer.py
-│       ├── webhook_crypto.py
-│       └── webhook_receiver.py
-├── test/
-│   ├── test_chaos.py
-│   └── test_forensic_log.py
-└── tests/
-    ├── test_integrante1.py
-    ├── test_integrante2.py
-    └── test_integrante3.py
+│   ├── vulcano_telemetry/
+│   │   ├── __init__.py           # API pública del paquete (__all__)
+│   │   ├── exceptions.py         # Excepciones semánticas del dominio (rol 1)
+│   │   ├── sanitizer.py          # Validadores declarativos para argparse (rol 1)
+│   │   ├── core_sqs.py           # Cliente Boto3 y mensajería SQS (rol 2)
+│   │   ├── webhook_crypto.py     # Firma y verificación HMAC-SHA256 (rol 3)
+│   │   ├── webhook_receiver.py   # Servidor receptor de webhooks (FastAPI, rol 3)
+│   │   ├── logging_engine.py     # Formatter JSON, QueueHandler/Listener y rotación gzip (rol 4)
+│   │   └── dispatcher.py         # Despachador de webhooks y worker SQS (rol 5)
+│   └── app_operator.py           # Punto de entrada CLI (argparse + except*, rol 5)
+├── tests/                        # pytest: contrato, forense, caos, integración y roles 1-3
+├── scripts/bootstrap_localstack.py
+├── docker-compose.yml
+├── requirements.txt              # 5 paquetes obligatorios de ejecución
+├── requirements-dev.txt          # pytest, ruff, httpx
+└── pyproject.toml                # Empaquetado, pytest y ruff
 ```
 
-Esta estructura corresponde a la rama `feat/integrantes-1-2-3`.
+## Módulos de dominio
 
-4. Integrante 1 — Excepciones y sanitización
+### Rol 1 — excepciones y sanitización
 
-Archivos principales:
+`exceptions.py` define la jerarquía del dominio: todo hereda de `VulcanoError`, que hereda de
+`Exception` (el criterio 1 prohíbe `BaseException`). Las subclases son `SQSConnectionError`,
+`QueueTimeoutError`, `CorruptedMessageError`, `WebhookSignatureError`, `WebhookTimestampError` y
+`WebhookDeliveryError`. `QueueTimeoutError` es la que distingue "la cola quedó vacía" de "SQS
+falló": sin ella, una espera agotada se confundiría con un error de conexión.
 
-- `exceptions.py`
-- `sanitizer.py`
+`sanitizer.py` expone cuatro validadores que la CLI usa como `type=` de `argparse`, así el rechazo
+ocurre antes de tocar la red y sale con código 2:
 
-Responsabilidades:
-
-- Definir excepciones personalizadas.
-- Validar nombres de colas SQS.
-- Validar tiempos de Long Polling.
-- Validar direcciones webhook.
-- Validar claves HMAC.
-- Proporcionar errores identificables para facilitar el diagnóstico.
-
-5. Integrante 2 — Motor SQS
-
-Archivo principal: `core_sqs.py`.
-
-Implementa la comunicación con Amazon SQS utilizando Boto3 y LocalStack.
-
-Funciones principales:
-
-- Obtener el cliente SQS.
-- Publicar eventos.
-- Recibir mensajes mediante Long Polling.
-- Eliminar mensajes explícitamente.
-- Gestionar errores de conexión y mensajes corruptos.
-- Mantener compatibilidad con las interfaces del proyecto.
-
-Los eventos publicados mediante `send_event()` incluyen:
-
-| Atributo | Descripción |
+| Validador | Qué exige |
 |---|---|
-| `TraceId` | Identificador de trazabilidad |
-| `EventTopic` | Tipo de evento |
-| `Timestamp` | Fecha y hora del evento |
+| `parse_queue_name` | Patrón completo `vulcano-[a-z0-9-]+-queue` (`re.fullmatch`: un `\n` final no pasa) |
+| `parse_wait_time` | Entero entre 1 y 20 segundos (rango de `WaitTimeSeconds`) |
+| `parse_webhook_url` | Esquema `http`/`https`, host válido y puerto válido si viene |
+| `parse_secret_key` | Clave HMAC de al menos 16 caracteres |
 
-La infraestructura utiliza una cola principal y una Dead Letter Queue (DLQ), con un máximo configurado de tres recepciones antes de la derivación de mensajes que no se eliminan correctamente.
+### Rol 2 — motor SQS
 
-6. Integrante 3 — Seguridad HMAC y receptor webhook
+`core_sqs.py` centraliza la mensajería con Boto3 apuntando a un endpoint configurable
+(`get_sqs_client(endpoint_url)`), y traduce todo `ClientError`/`BotoCoreError` a
+`SQSConnectionError` con `add_note()` para la URL y la operación.
 
-Archivos principales:
-
-- `webhook_crypto.py`
-- `webhook_receiver.py`
-
-Firma HMAC-SHA256
-
-El sistema genera una firma criptográfica sobre el timestamp y los bytes originales del mensaje.
-
-Formato del encabezado:
-
-`X-Webhook-Signature: t=<timestamp>,v1=<firma>`
-
-La verificación utiliza comparación segura y rechaza mensajes con firmas incorrectas o timestamps fuera de la tolerancia de 300 segundos.
-
-Receptor FastAPI
-
-Endpoint:
-
-`POST /webhook`
-
-Secuencia de procesamiento:
-
-1. Recibir los bytes originales del cuerpo HTTP.
-2. Validar el timestamp y la firma HMAC.
-3. Interpretar y validar el contenido JSON.
-4. Publicar el evento en SQS.
-5. Responder HTTP `202 Accepted` tras la publicación exitosa.
-
-La clave HMAC del receptor se configura mediante la variable de entorno `VULCANO_WEBHOOK_SECRET`.
-
-7. Requisitos
-
-- Python (versión utilizada en las pruebas: 3.14.0).
-- Docker con LocalStack.
-- Dependencias de `requirements.txt`.
-
-8. Instalación en Windows PowerShell
-
-Clonar el repositorio:
-
-```powershell
-git clone https://github.com/No-Py-No-gain/Vulcano-Pay.git
-cd Vulcano-Pay
-```
-
-Para trabajar con los cambios de los Integrantes 1, 2 y 3 mientras el Pull Request #9 esté pendiente:
-
-```powershell
-git fetch origin
-git switch feat/integrantes-1-2-3
-```
-
-Crear y activar el entorno virtual:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-Instalar dependencias:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-9. Infraestructura LocalStack
-
-Configuración utilizada en las pruebas:
-
-| Recurso | Valor |
+| Función | Comportamiento |
 |---|---|
-| Endpoint | `http://localhost:4566` |
-| Región | `us-east-1` |
-| Cola principal | `vulcano-events-queue` |
-| DLQ | `vulcano-events-dlq` |
-| `maxReceiveCount` | `3` |
-| Visibility Timeout | `30` segundos |
+| `send_event(client, queue_url, event_data, trace_id=None, event_topic="payment.event", webhook_id=None)` | Serializa una sola vez y publica con los atributos de trazabilidad |
+| `produce_event(client, queue_url, event_data)` | Compatibilidad con la interfaz original; delega en `send_event` |
+| `receive_events(...)` | Long polling; levanta `CorruptedMessageError` si un cuerpo no es JSON |
+| `receive_events_safe(...)` | Igual, pero devuelve `{"valid": [...], "corrupted": [...]}` sin abortar el lote |
+| `consume_events(...)` | Contrato estable de consumo: lista de mensajes con `approx_receive_count` y la marca `corrupt` |
+| `delete_message(client, queue_url, receipt_handle)` | Borra explícitamente; señal de "entregado" |
 
-La rama `chore/localstack-infra` contiene:
+Los eventos publicados con `send_event` llevan estos atributos de mensaje:
 
-- `docker-compose.yml`: definición del contenedor LocalStack.
-- `scripts/bootstrap_localstack.py`: creación y reconciliación de colas y atributos SQS.
-- Pruebas específicas de infraestructura.
+| Atributo | Tipo | Origen |
+|---|---|---|
+| `TraceId` | `String` | parámetro o `uuid4()`; es la columna vertebral de la trazabilidad |
+| `EventTopic` | `String` | parámetro (por defecto `payment.event`) |
+| `Timestamp` | `String` | ISO 8601 UTC del instante del evento |
+| `WebhookId` | `String` | opcional: identidad del webhook, cuando el emisor la conoce |
 
-Estos archivos todavía no forman parte de `feat/integrantes-1-2-3`.
+Un cuerpo corrupto nunca se borra y nunca cancela al resto del lote: queda aislado para que el
+`VisibilityTimeout` lo devuelva a la cola y el `RedrivePolicy` lo derive a la DLQ.
 
-Una vez integrados, la infraestructura podrá iniciarse con:
+### Rol 3 — seguridad HMAC y receptor
 
-```powershell
-docker compose up -d
-python .\scripts\bootstrap_localstack.py
+`webhook_crypto.py` firma `timestamp + "." + payload_bytes` con HMAC-SHA256 y compara con
+`hmac.compare_digest()`. `build_signature_header()` es el único dueño del formato de la cabecera, así
+emisor y receptor no pueden divergir:
+
+```
+X-Webhook-Signature: t=<timestamp>,v1=<hmac-hexadecimal>
 ```
 
-Estos comandos requieren disponer de los archivos de infraestructura en la rama de trabajo. No deben ejecutarse desde una rama donde aún no existan.
+`verify_signature()` valida primero la forma de la cabecera, después la ventana anti-replay
+(±300 s) y por último la firma. Una firma malformada o ausente es `WebhookSignatureError`; un
+timestamp viejo o futuro es `WebhookTimestampError`.
 
-El script de inicialización crea o reutiliza las colas y configura la Redrive Policy.
+`webhook_receiver.py` expone `POST /webhook` con FastAPI. La secuencia es: leer los **bytes crudos**,
+verificar firma y timestamp, parsear el JSON, publicar en SQS y responder `202 Accepted`. El cliente
+de SQS y la URL de la cola se resuelven en el `lifespan` (una sola vez) con `get_queue_url`, y la
+clave HMAC se toma de `VULCANO_WEBHOOK_SECRET`: no hay secretos en el código.
 
-10. Configuración HMAC
+## Puesta en marcha
 
-Antes de iniciar el receptor, configurar una clave de desarrollo de al menos 16 caracteres:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+pip install -e . --no-deps                # habilita el comando `vulcano`
 
-```powershell
-$env:VULCANO_WEBHOOK_SECRET = "<clave_de_desarrollo>"
+docker compose up -d                      # LocalStack en http://localhost:4566
+python scripts/bootstrap_localstack.py    # crea la cola y su DLQ con el RedrivePolicy
 ```
 
-La misma clave debe utilizarse al enviar los webhooks.
+El bootstrap es idempotente: se puede correr las veces que haga falta y reconcilia los atributos de
+las colas en lugar de duplicarlas. En Windows, los mismos comandos se ejecutan en PowerShell con
+`.\.venv\Scripts\Activate.ps1` y `python .\scripts\bootstrap_localstack.py`; no hace falta ninguna
+variante del código.
 
-**Seguridad:** no utilizar secretos de producción en el código ni incorporarlos a Git.
+## Uso
 
-11. Ejecución del receptor
+Tres subcomandos. Todos comparten `-q/--queue`, `-w/--wait-time`, `--url`, `--secret`, `--timeout`
+y `--log-file`; `vulcano --help` muestra la tabla de códigos de salida.
 
-En una terminal PowerShell, con el entorno virtual activo y LocalStack disponible:
+```bash
+# 1) Encolar un evento directamente en SQS
+vulcano produce-sqs --payload '{"transaction_id":"tx_1","amount":350.0}' --event-topic payment.settled
 
-```powershell
-python -m uvicorn src.vulcano_telemetry.webhook_receiver:app --host 127.0.0.1 --port 8000
+# 2) Levantar el receptor de webhooks (necesita VULCANO_WEBHOOK_SECRET y las colas creadas)
+vulcano start-receiver --port 8000
+
+# 3) Consumir la cola y despachar (--max-lotes hace la corrida determinista)
+vulcano start-dispatcher --url http://127.0.0.1:9000/webhook-destino --max-lotes 1
 ```
 
-El receptor quedará escuchando solicitudes HTTP.
+## Variables de entorno
 
-12. Envío de webhooks desde la CLI
+Sólo se leen las variables de esta tabla; el resto de la configuración va por argumento de la CLI.
 
-En otra terminal:
+| Variable | Default | Quién la lee |
+|---|---|---|
+| `VULCANO_WEBHOOK_SECRET` | — (obligatoria, mínimo 16 caracteres) | receptor |
+| `VULCANO_ENDPOINT_URL` | `http://localhost:4566` | bootstrap y receptor |
+| `VULCANO_REGION` | `us-east-1` | bootstrap |
+| `VULCANO_QUEUE_NAME` | `vulcano-events-queue` | bootstrap y receptor |
+| `VULCANO_DLQ_NAME` | `vulcano-events-dlq` | bootstrap |
+| `VULCANO_MAX_RECEIVE_COUNT` | `3` | bootstrap |
+| `VULCANO_VISIBILITY_TIMEOUT` | `30` | bootstrap |
+| `VULCANO_READY_TIMEOUT` | `60` | bootstrap (espera a que LocalStack responda) |
+| `VULCANO_LOG_FILE` | `vulcano_events.log` | CLI |
+| `VULCANO_IT` | — | suite de pruebas (`1` habilita las de integración) |
 
-```powershell
-python .\src\app_operator.py --mode send-webhook --url http://127.0.0.1:8000/webhook --secret "<clave_de_desarrollo>"
+Todo lo demás es argumento: `--queue`, `--wait-time`, `--url`, `--secret`, `--timeout`, `--host`,
+`--port`, `--payload`, `--event-topic`, `--max-lotes` y `--log-file`. El tamaño de rotación (2 MB), la
+cantidad de respaldos (3) y la ventana anti-replay (300 s) son constantes del engine y del
+verificador.
+
+Sin `VULCANO_WEBHOOK_SECRET` el receptor arranca pero responde `503` a todo: no puede autenticar a
+nadie.
+
+## Códigos de respuesta del receptor
+
+| Situación | Código | Excepción |
+|---|---|---|
+| Firma HMAC inválida o ausente | `401` | `WebhookSignatureError` |
+| Timestamp fuera de la ventana anti-replay | `403` | `WebhookTimestampError` |
+| JSON inservible después de validar la firma | `422` | — |
+| Secreto sin configurar o LocalStack caído al encolar | `503` | `SQSConnectionError` |
+| Webhook válido y encolado | `202` | — |
+
+## Códigos de salida de la CLI
+
+`0` correcto · `2` validación de argumentos · `3` firma o timestamp · `4` SQS · `5` entrega fallida ·
+`130` interrupción por teclado.
+
+## Observabilidad
+
+Cada línea del registro es un objeto JSON con `timestamp` en ISO 8601 UTC del **instante del evento**,
+`level`, `logger`, `message`, `process` y `thread_name`. Se agregan, sólo cuando la aplicación los
+aporta, `trace_id`, `message_id`, `webhook_id`, `event_topic`, `signature`, `latency_ms`,
+`retry_count` y `notes`. Las excepciones se registran como árbol (`exception`) más `traceback` en
+texto; un `ExceptionGroup` conserva todos sus hijos y las notas de cada uno.
+
+La escritura en disco ocurre únicamente en el hilo del `QueueListener`. El archivo activo rota a
+2 MB, se conservan tres respaldos y cada respaldo se comprime a `.gz` de forma atómica.
+
+## Pruebas
+
+```bash
+.venv/bin/python -m pytest -q                  # unitarias, sin Docker
+VULCANO_IT=1 .venv/bin/python -m pytest -q     # incluye las de integración con LocalStack
 ```
 
-Consultar ayuda:
+| Archivo | Qué verifica |
+|---|---|
+| `tests/test_compliance.py` | criterios 1 y 2 por análisis del AST del repo completo |
+| `tests/test_integrante1.py` | jerarquía de excepciones y los cuatro sanitizadores |
+| `tests/test_integrante2.py` | publicación, recepción, mensaje corrupto y borrado en SQS (cliente simulado) |
+| `tests/test_integrante3.py` | firma/verificación HMAC y el receptor por HTTP (`TestClient`) |
+| `tests/test_localstack_infra.py` | colas, `RedrivePolicy` y idempotencia del bootstrap |
+| `tests/test_forensic_log.py` | contrato del log, árbol de excepciones, rotación gzip sin pérdida |
+| `tests/test_webhook_dispatcher.py` | firma sobre bytes exactos, borrar sólo en 2xx, veneno aislado |
+| `tests/test_cli.py` | subcomandos, códigos de salida y apagado del pipeline |
+| `tests/test_chaos.py` | rechazos 401/403, replay y derivación real a la DLQ |
 
-```powershell
-python .\src\app_operator.py --help
-```
+Las pruebas de integración se marcan con `@pytest.mark.integration` y se saltean solas si
+`VULCANO_IT` no vale `1`: la suite unitaria corre sin Docker. Las de los roles 1-3 usan dobles, así
+que tampoco necesitan LocalStack.
 
-Consultar eventos SQS:
+## Cumplimiento de los criterios de evaluación
 
-```powershell
-python .\src\app_operator.py --mode start-dispatcher
-```
+| # | Criterio | Dónde | Cómo se verifica |
+|---|---|---|---|
+| 1 | Excepciones propias heredan de `Exception`; sin `except: pass` ni `BaseException` | `exceptions.py`, todo el paquete | `test_compliance.py` recorre el AST y falla si aparece un `except` desnudo, uno que capture `BaseException` o uno cuyo cuerpo sea sólo `pass` |
+| 2 | PEP 765: sin `return`, `break` ni `continue` en `finally` | `app_operator.py` y el resto | `test_compliance.py` busca salidas abruptas alcanzables dentro de cada `finally`, sin cruzar definiciones de función |
+| 3 | Boto3 con endpoint configurable a LocalStack | `core_sqs.py`, `dispatcher.py` | `get_sqs_client(endpoint_url)` y el bootstrap apuntando a `:4566` |
+| 4 | HMAC sobre bytes crudos con `hmac.compare_digest()` | `webhook_crypto.py`, `dispatcher.py` | el receptor verifica antes de parsear; el emisor firma los mismos bytes que envía |
+| 5 | Escritura de logs sólo por `QueueHandler` / `QueueListener` | `logging_engine.py` | ningún `FileHandler` cuelga del logger; la escritura ocurre en el hilo del listener |
+| 6 | Marcas de tiempo en ISO 8601 UTC estricto | `AsyncJSONFormatter` | cada línea se parsea y se comprueba que el offset sea `+00:00` |
 
-**Alcance actual:** el modo `start-dispatcher` de esta CLI recibe eventos de SQS y registra su cantidad. No implementa por sí mismo un despacho HTTP completo hacia destinos externos.
+## Decisiones de diseño
 
-13. Pruebas automatizadas
+**El reintento lo hace SQS, no el worker.** Ante una entrega fallida el mensaje no se borra: el
+`VisibilityTimeout` lo devuelve a la cola y el `RedrivePolicy` lo deriva a la DLQ al superar
+`maxReceiveCount`. Reintentar dentro del proceso escondería el fallo y no alimentaría el contador que
+dispara la derivación.
 
-Las pruebas de los Integrantes 1, 2 y 3 se ejecutan mediante:
+**Un mensaje venenoso no arrastra el lote.** Un cuerpo que no es JSON se registra como venenoso y no
+se borra, pero el resto del lote se procesa igual. Abortar la recepción completa haría que un solo
+mensaje roto bloqueara a todos los que vinieron detrás y la DLQ nunca se llenaría. El módulo expone
+las dos variantes para que el consumidor elija: `receive_events` aborta y `receive_events_safe`
+aísla; el worker usa la segunda.
 
-```powershell
-python -m pytest .\tests\test_integrante1.py .\tests\test_integrante2.py .\tests\test_integrante3.py -v
-```
+**El registro se formatea en el hilo del listener.** El `prepare()` de `QueueHandler` de la stdlib
+formatea el registro y anula `exc_info` antes de encolarlo, lo que borraría el árbol de la excepción
+y devolvería el costo de formateo al hilo que loguea. El engine usa una subclase que sólo copia el
+registro.
 
-Resultados obtenidos durante las verificaciones locales:
+**El formato de la cabecera tiene un solo dueño.** `build_signature_header()` compone
+`t=…,v1=…` y `verify_signature()` lo interpreta; ninguno de los dos reimplementa el del otro, así el
+round-trip emisor/receptor está garantizado por construcción y no por convención.
 
-| Integrante | Pruebas aprobadas |
-|---|---:|
-| Integrante 1 | 40 |
-| Integrante 2 | 14 |
-| Integrante 3 | 19 |
-| **Total** | **73** |
-
-También se verificó la integración real entre la CLI, el receptor FastAPI y LocalStack SQS.
-
-El receptor respondió HTTP `202 Accepted`, y se confirmó la presencia del mensaje en la cola principal con sus atributos de trazabilidad.
-
-Las 73 pruebas corresponden a los tres módulos indicados y no representan una certificación de todas las funcionalidades del repositorio.
-
-14. Estado de integración
-
-Los módulos de los Integrantes 1, 2 y 3 se desarrollaron y verificaron localmente.
-
-Los cambios se publicaron en:
-
-- Rama: `feat/integrantes-1-2-3`.
-- Commit inicial: `5a1839b`.
-- Pull Request: `#9`.
-
-La integración con la infraestructura LocalStack, el dispatcher HTTP y otros componentes desarrollados por el equipo requiere revisión y pruebas conjuntas antes de considerarse finalizada.
+**La clave HMAC llega por entorno.** `VULCANO_WEBHOOK_SECRET` es obligatoria y se valida su longitud
+mínima al verificar; el repositorio no lleva secretos versionados.

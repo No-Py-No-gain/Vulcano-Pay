@@ -53,3 +53,11 @@ Thumbs.db
 
 # --- Herramientas de agente / caché local ---
 .atl/
+
+# --- Documentación local de trabajo (no se versiona: ver README.md para la entregable) ---
+/odd/
+/docs/
+
+# --- Memoria Engram (guarda preventiva; su almacén real vive en ~/.engram) ---
+.engram/
+*.engram.db*
