@@ -340,6 +340,101 @@ vulcano start-receiver --port 8000
 vulcano start-dispatcher --url http://127.0.0.1:9000/webhook-destino --max-lotes 1
 ```
 
+La CLI no imprime el resultado en pantalla: informa por el código de salida y por el registro JSON.
+Para ver qué hizo una corrida, mirá las últimas líneas del archivo de log (`tail -2
+vulcano_events.log`), que es donde queda cada entrega con su `trace_id` y su `latency_ms`.
+
+### Prueba de punta a punta
+
+El receptor sólo acepta webhooks firmados, así que para probar el camino completo hacen falta el
+secreto, un emisor que firme y un destino que confirme con 2xx. Los comandos de abajo están
+verificados contra el LocalStack de este repo.
+
+**Terminal 1 — el secreto y el receptor.** Sin `VULCANO_WEBHOOK_SECRET` el receptor responde `503` a
+todo: no puede autenticar a nadie.
+
+```bash
+export VULCANO_WEBHOOK_SECRET="clave-de-demostracion-suficientemente-larga"
+vulcano --help                 # subcomandos y tabla de códigos de salida
+vulcano start-receiver --port 8000
+```
+
+**Terminal 2 — un destino local que confirma con 2xx.** El worker sólo borra el mensaje cuando el
+destino responde 2xx; cualquier otra cosa lo deja en la cola y alimenta el `RedrivePolicy`.
+
+```bash
+python3 -c "
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(200)
+        self.end_headers()
+        print('POST recibido, respondido 200')
+
+HTTPServer(('127.0.0.1', 9000), Handler).handle_request()
+"
+```
+
+**Terminal 3 — firmar y enviar un webhook válido.** El cuerpo se serializa una sola vez porque la
+firma se calcula sobre esos bytes exactos.
+
+```bash
+python3 - <<'PY'
+import json, os, requests
+from vulcano_telemetry.webhook_crypto import build_signature_header
+
+secret = os.environ["VULCANO_WEBHOOK_SECRET"]
+body = json.dumps({"transaction_id": "tx_demo", "amount": 350.0}, separators=(",", ":")).encode()
+_, header = build_signature_header(secret, body)
+response = requests.post(
+    "http://127.0.0.1:8000/webhook",
+    data=body,
+    headers={"Content-Type": "application/json", "X-Webhook-Signature": header},
+    timeout=5,
+)
+print(response.status_code, response.text)   # 202 {"status":"accepted","message_id":"..."}
+PY
+```
+
+**Terminal 1 — una pasada del worker** contra el destino de la terminal 2.
+
+```bash
+vulcano start-dispatcher --url http://127.0.0.1:9000/webhook-destino \
+  --secret "$VULCANO_WEBHOOK_SECRET" --max-lotes 1
+tail -2 vulcano_events.log
+```
+
+**Mirar la cola y la DLQ sin la CLI de AWS.** Las credenciales simuladas son las mismas que usa el
+bootstrap.
+
+```bash
+python3 - <<'PY'
+import boto3
+
+sqs = boto3.client("sqs", endpoint_url="http://localhost:4566", region_name="us-east-1",
+                   aws_access_key_id="test", aws_secret_access_key="test")
+for name in ("vulcano-events-queue", "vulcano-events-dlq"):
+    url = sqs.get_queue_url(QueueName=name)["QueueUrl"]
+    attributes = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+    print(name, attributes["Attributes"]["ApproximateNumberOfMessages"])
+PY
+```
+
+**Comprobar un código de error.** Una cola inexistente es un error de SQS, no de validación de
+argumentos:
+
+```bash
+vulcano produce-sqs -q vulcano-no-existe-queue --payload '{"a":1}'
+echo "exit: $?"                # 4 — error de SQS
+```
+
+Lo más rápido para ver el sistema entero sin armar el escenario a mano es la suite de integración:
+
+```bash
+VULCANO_IT=1 .venv/bin/python -m pytest -q
+```
+
 ## Variables de entorno
 
 Sólo se leen las variables de esta tabla; el resto de la configuración va por argumento de la CLI.
