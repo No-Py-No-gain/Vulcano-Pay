@@ -188,7 +188,7 @@ Sólo se leen las variables de esta tabla; el resto de la configuración va por 
 | `VULCANO_WEBHOOK_SECRET` | — (obligatoria, mínimo 16 caracteres) | receptor |
 | `VULCANO_ENDPOINT_URL` | `http://localhost:4566` | bootstrap y receptor |
 | `VULCANO_REGION` | `us-east-1` | bootstrap |
-| `VULCANO_QUEUE_NAME` | `vulcano-events-queue` | bootstrap y receptor |
+| `VULCANO_QUEUE_NAME` | `vulcano-events-queue` | bootstrap, receptor y valor por defecto de `--queue` en la CLI |
 | `VULCANO_DLQ_NAME` | `vulcano-events-dlq` | bootstrap |
 | `VULCANO_MAX_RECEIVE_COUNT` | `3` | bootstrap |
 | `VULCANO_VISIBILITY_TIMEOUT` | `30` | bootstrap |
@@ -211,13 +211,19 @@ nadie.
 | Firma HMAC inválida o ausente | `401` | `WebhookSignatureError` |
 | Timestamp fuera de la ventana anti-replay | `403` | `WebhookTimestampError` |
 | JSON inservible después de validar la firma | `422` | — |
-| Secreto sin configurar o LocalStack caído al encolar | `503` | `SQSConnectionError` |
+| Secreto sin configurar (o demasiado corto) | `503` | `HTTPException` |
+| LocalStack caído o cola irresoluble al encolar | `503` | `SQSConnectionError` |
 | Webhook válido y encolado | `202` | — |
 
 ## Códigos de salida de la CLI
 
 `0` correcto · `2` validación de argumentos · `3` firma o timestamp · `4` SQS · `5` entrega fallida ·
 `130` interrupción por teclado.
+
+El `4` cubre los tres momentos en que SQS puede fallar: una cola que no se puede resolver —también
+en `start-receiver`, donde se resuelve **antes** de entregar el proceso a uvicorn, para que una cola
+inexistente no termine en un `SystemExit` de uvicorn—, un error al publicar con `produce-sqs` y un
+error al recibir o borrar con `start-dispatcher`.
 
 ## Observabilidad
 
@@ -275,7 +281,9 @@ dispara la derivación.
 se borra, pero el resto del lote se procesa igual. Abortar la recepción completa haría que un solo
 mensaje roto bloqueara a todos los que vinieron detrás y la DLQ nunca se llenaría. El módulo expone
 las dos variantes para que el consumidor elija: `receive_events` aborta y `receive_events_safe`
-aísla; el worker usa la segunda.
+aísla. El worker no usa ninguna de las dos: recibe con `client.receive_message` y aísla el cuerpo
+corrupto mensaje por mensaje, porque necesita borrar de a uno y `consume_events` todavía no expone
+el borrado.
 
 **El registro se formatea en el hilo del listener.** El `prepare()` de `QueueHandler` de la stdlib
 formatea el registro y anula `exc_info` antes de encolarlo, lo que borraría el árbol de la excepción

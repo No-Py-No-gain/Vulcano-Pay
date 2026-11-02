@@ -9,11 +9,13 @@ real y el único que puede terminar en la DLQ.
 Detalle crítico: se firman y se envían **los mismos bytes**. `requests.post(..., json=payload)`
 re-serializa el diccionario y rompería la firma aunque el contenido sea equivalente.
 
-Puentes documentados con los roles 1-3 (ver W0 del documento de tareas): `consume_events` de
-`core_sqs` aborta el lote completo ante un cuerpo corrupto y todavía no expone el
-`ApproximateReceiveCount`, y `core_sqs` aún no tiene `delete_message`. Mientras eso no llegue, el
-worker usa las primitivas de Boto3 directamente: sin aislamiento por mensaje la DLQ no puede
-funcionar, porque un solo mensaje venenoso cancelaría el lote entero.
+Puentes con los roles 1-3 (ver W0 del documento de tareas): `consume_events` de `core_sqs` nunca
+aborta el lote —devuelve cada evento con `approx_receive_count` y marca el cuerpo inservible con
+`corrupt=True`—, pero `core_sqs` todavía no tiene `delete_message`. El worker, por eso, no usa
+`receive_events_safe` sino que recibe con las primitivas de Boto3 directamente
+(`client.receive_message`) y aísla el mensaje corrupto por mensaje: necesita borrar uno por uno, y
+sin ese aislamiento la DLQ no podría funcionar porque un solo mensaje venenoso cancelaría el lote
+entero.
 """
 
 from __future__ import annotations

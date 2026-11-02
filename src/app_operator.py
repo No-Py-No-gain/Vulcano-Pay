@@ -153,7 +153,9 @@ def _add_shared_options(parser: argparse.ArgumentParser) -> None:
         "-q",
         "--queue",
         type=parse_queue_name,
-        default=DEFAULT_QUEUE,
+        # El entorno aporta el valor por defecto y la bandera manda cuando se pasa: así
+        # `VULCANO_QUEUE_NAME` sigue sirviendo sin `-q` y nunca pisa una elección explícita.
+        default=os.environ.get("VULCANO_QUEUE_NAME") or DEFAULT_QUEUE,
         help=f"Nombre de la cola SQS (patrón vulcano-<nombre>-queue, por defecto {DEFAULT_QUEUE}).",
     )
     parser.add_argument(
@@ -285,7 +287,19 @@ def _produce_event(args: argparse.Namespace, logger: logging.Logger) -> int:
 
 
 def _start_receiver(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """Levanta el receptor del rol 3 por su ruta de importación, para que uvicorn lo cargue."""
+    """Levanta el receptor del rol 3 por su ruta de importación, para que uvicorn lo cargue.
+
+    La cola se resuelve **antes** de entregar el proceso a uvicorn. Si se dejara al `lifespan` del
+    receptor, uvicorn convertiría el fallo de SQS en un `SystemExit(3)` —que el criterio 1 prohíbe
+    capturar— y el código de salida 4 documentado nunca se emitiría. Resolviéndola acá, el
+    `SQSConnectionError` con sus notas llega al `except*` de `main()`.
+
+    El nombre resuelto se exporta a `VULCANO_QUEUE_NAME` porque es la variable que lee el receptor:
+    sin esto `-q/--queue` quedaría silenciosamente ignorado.
+    """
+    client = get_sqs_client()
+    _resolve_queue_url(client, args.queue)
+    os.environ["VULCANO_QUEUE_NAME"] = args.queue
     logger.info(f"Levantando el receptor de webhooks en http://{args.host}:{args.port}")
     uvicorn.run(RECEIVER_APP, host=args.host, port=args.port)
     return 0

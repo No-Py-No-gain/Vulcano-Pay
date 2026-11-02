@@ -262,6 +262,9 @@ def test_start_receiver_runs_uvicorn_with_the_receiver_app(pipeline, monkeypatch
     """El receptor se levanta por la ruta de importación, para que uvicorn lo construya a demanda."""
     invocations: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
+    # La CLI resuelve la cola antes de ceder el proceso a uvicorn (código 4), así que el doble
+    # evita que la prueba unitaria dependa de un SQS vivo.
+    monkeypatch.setattr(app_operator, "get_sqs_client", lambda: SQSClientWithQueue())
     monkeypatch.setattr(app_operator.uvicorn, "run", lambda *args, **kwargs: invocations.append((args, kwargs)))
 
     assert app_operator.main(["start-receiver", "--host", "0.0.0.0", "--port", "9999"]) == 0
